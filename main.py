@@ -99,9 +99,7 @@ def hotkey_loop():
 # ==================== 3. 界面与交互模块 ====================
 def refresh_all_data():
     """刷新所有列表数据"""
-    # 刷新工作台病人树
     for row in tree.get_children(): tree.delete(row)
-    # 刷新管理台病人树
     for row in mgr_tree.get_children(): mgr_tree.delete(row)
     
     conn = sqlite3.connect(DB_FILE)
@@ -111,7 +109,6 @@ def refresh_all_data():
         tree.insert("", "end", values=row)
         mgr_tree.insert("", "end", values=row)
         
-    # 刷新模板列表
     tpl_listbox.delete(0, tk.END)
     mgr_tpl_listbox.delete(0, tk.END)
     cursor.execute("SELECT name FROM templates")
@@ -120,7 +117,6 @@ def refresh_all_data():
         mgr_tpl_listbox.insert(tk.END, row[0])
     conn.close()
 
-# --- 患者管理逻辑 ---
 def save_patient():
     data = (p_bed.get(), p_name.get(), p_gender.get(), p_age.get(), 
             p_admit.get(), p_comp.get(), p_adiag.get(), p_cdiag.get())
@@ -155,7 +151,6 @@ def on_patient_select(event):
         entry.delete(0, tk.END)
         entry.insert(0, str(vals[i]) if vals[i] != 'None' else "")
 
-# --- 模板管理逻辑 ---
 def save_template():
     t_name = tpl_name_entry.get()
     t_content = tpl_content_text.get("1.0", tk.END).strip()
@@ -267,8 +262,9 @@ def setup_ui():
     
     p_bed, p_name, p_gender, p_age, p_admit, p_comp, p_adiag, p_cdiag = entries
     
-    tk.Button(pmgr_right, text="保存 / 新增", command=save_patient, bg="#dff0d8").grid(row=10, column=0, columnspan=2, fill=tk.X, pady=10)
-    tk.Button(pmgr_right, text="删除选中患者", command=delete_patient, bg="#f2dede").grid(row=11, column=0, columnspan=2, fill=tk.X)
+    # 【修复位置：将 fill=tk.X 修改为 sticky=tk.EW】
+    tk.Button(pmgr_right, text="保存 / 新增", command=save_patient, bg="#dff0d8").grid(row=10, column=0, columnspan=2, sticky=tk.EW, pady=10)
+    tk.Button(pmgr_right, text="删除选中患者", command=delete_patient, bg="#f2dede").grid(row=11, column=0, columnspan=2, sticky=tk.EW)
 
     # ---------- Tab 3: 模板管理台 ----------
     tab_tmgr = ttk.Frame(notebook)
@@ -294,7 +290,6 @@ def setup_ui():
     
     tk.Button(tmgr_right, text="保存 / 新增模板", command=save_template, bg="#dff0d8", height=2).pack(fill=tk.X)
 
-    # 启动初始化
     refresh_all_data()
     threading.Thread(target=hotkey_loop, daemon=True).start()
     root.mainloop()
