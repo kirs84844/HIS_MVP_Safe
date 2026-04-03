@@ -13,10 +13,11 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Set up Python 3.8 (For Win7 Compatibility)
+    - name: Set up Python 3.8 (32-bit 强制降维编译)
       uses: actions/setup-python@v4
       with:
         python-version: '3.8.10'
+        architecture: 'x86'  # 核心修复点：强制指定 32 位架构
 
     - name: Install dependencies
       run: |
@@ -30,5 +31,5 @@ jobs:
     - name: Upload EXE
       uses: actions/upload-artifact@v4
       with:
-        name: HIS_MVP_Safe_Version
+        name: HIS_MVP_Safe_32bit_Version
         path: dist/main.exe
