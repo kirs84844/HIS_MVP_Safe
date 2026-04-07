@@ -15,7 +15,7 @@ RPA_CONFIG = {
     
     # --- 像素轮询核心配置 ---
     "READY_PIXEL_POS": (50, 120),        # 状态特征点坐标
-    "READY_PIXEL_RGB": (177, 177, 177),  # 就绪状态的 RGB 值
+    "READY_PIXEL_RGB": (255, 255, 255),  # 就绪状态的 RGB 值
     "MAX_WAIT_FREEZE": 12.0,             # 极限超时熔断时间(秒)
     
     "AREA_PROGRESS_RECORD": (64, 267),   # 4. 病程记录焦点区 (延时1s)
