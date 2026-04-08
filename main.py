@@ -7,20 +7,27 @@ import ctypes.wintypes
 import threading
 import time
 
-# ==================== RPA 物理锚点与轮询配置 ====================
+# [核心防御] 强制系统 DPI 感知，确保测出的坐标是绝对物理像素，无视 Windows 缩放
+try:
+    ctypes.windll.user32.SetProcessDPIAware()
+except AttributeError:
+    pass
+
+# ==================== RPA 物理锚点与轮询配置 (实地测绘数据) ====================
 RPA_CONFIG = {
-    "BTN_SWITCH_PATIENT": (31, 84),      # 1. 切换病人按钮 (无延迟)
-    "PATIENT_FIRST_ROW": (86, 217),      # 2. 病人列表首行
+    "BTN_SWITCH_PATIENT": (32, 96),      # 1. 切换病人按钮 
+    "PATIENT_FIRST_ROW": (86, 215),      # 2. 病人列表首行
     "LINE_HEIGHT": 18,                   # 3. 列表行高像素
     
     # --- 像素轮询核心配置 ---
-    "READY_PIXEL_POS": (50, 120),        # 状态特征点坐标
-    "READY_PIXEL_RGB": (245, 245, 245),  # 就绪状态的 RGB 值
+    "READY_PIXEL_POS": (28, 95),         # 用于侦测假死的特征点
+    "READY_PIXEL_RGB": (245, 245, 245),  # 就绪变白时的 RGB
     "MAX_WAIT_FREEZE": 12.0,             # 极限超时熔断时间(秒)
     
-    "AREA_PROGRESS_RECORD": (64, 267),   # 4. 病程记录焦点区 (延时1s)
-    "BTN_NEW_RECORD": (213, 82),         # 5. 新建病史按钮 (无延迟)
-    "TPL_OPTION": (836, 369),            # 6. 二级菜单病史模板 (延时1s)
+    # --- UI 破障与交互配置 ---
+    "AREA_SAFE_BLANK": (500, 642),       # 新增：纯空白安全区，用于消除列表遮挡
+    "AREA_PROGRESS_RECORD": (60, 267),   # 病程记录区 (双击唤醒菜单)
+    "TPL_OPTION": (825, 370),            # 二级菜单具体模板 
 }
 
 DB_FILE = "his_data.db"
@@ -33,8 +40,8 @@ gdi32 = ctypes.windll.gdi32
 
 def mouse_click(x, y):
     user32.SetCursorPos(x, y)
-    user32.mouse_event(2, 0, 0, 0, 0) # 左键按下
-    user32.mouse_event(4, 0, 0, 0, 0) # 左键抬起
+    user32.mouse_event(2, 0, 0, 0, 0)
+    user32.mouse_event(4, 0, 0, 0, 0)
 
 def mouse_double_click(x, y):
     mouse_click(x, y)
@@ -42,7 +49,6 @@ def mouse_double_click(x, y):
     mouse_click(x, y)
 
 def get_pixel_color(x, y):
-    """提取屏幕指定坐标的精准 RGB 值"""
     hdc = user32.GetDC(0)
     pixel = gdi32.GetPixel(hdc, x, y)
     user32.ReleaseDC(0, hdc)
@@ -88,42 +94,53 @@ def start_automation_flow(loop_count):
     for i in range(loop_count):
         if not is_running_auto: break 
         
-        status_update(f"正在处理第 {i+1}/{loop_count} 个患者...")
+        status_update(f"正在扫描第 {i+1}/{loop_count} 行列表...")
         
         # --- 动作 1: 唤醒列表 (无延迟) ---
         mouse_click(*RPA_CONFIG["BTN_SWITCH_PATIENT"])
-        time.sleep(0.2) # 极微小缓冲，防止系统未响应点击
+        time.sleep(0.2) 
         
         # --- 动作 2: 步进寻址双击 ---
         target_y = RPA_CONFIG["PATIENT_FIRST_ROW"][1] + (i * RPA_CONFIG["LINE_HEIGHT"])
         mouse_double_click(RPA_CONFIG["PATIENT_FIRST_ROW"][0], target_y)
         
-        # --- 动作 3: 像素轮询对抗系统假死 ---
-        status_update(f"轮询侦测中 (极限 12s)... [进度: {i+1}/{loop_count}]")
-        time.sleep(0.5) # [防御机制] 给予系统 0.5s 让按钮变灰，防止误读旧的白色
+        # --- 动作 3: 【双段像素轮询】 ---
+        status_update(f"侦测系统挂起状态... [进度: {i+1}/{loop_count}]")
         
-        polled_time = 0.5
+        # 3.1: 侦测开始假死 (变灰)
+        wait_busy = 0.0
+        while wait_busy < 3.0:
+            if not is_running_auto: break
+            if get_pixel_color(*RPA_CONFIG["READY_PIXEL_POS"]) != RPA_CONFIG["READY_PIXEL_RGB"]:
+                break 
+            time.sleep(0.1)
+            wait_busy += 0.1
+            
+        # 3.2: 侦测假死结束 (变回就绪白)
+        polled_time = 0.0
         is_ready = False
         while polled_time < RPA_CONFIG["MAX_WAIT_FREEZE"]:
             if not is_running_auto: break
-            
-            current_rgb = get_pixel_color(*RPA_CONFIG["READY_PIXEL_POS"])
-            if current_rgb == RPA_CONFIG["READY_PIXEL_RGB"]:
+            if get_pixel_color(*RPA_CONFIG["READY_PIXEL_POS"]) == RPA_CONFIG["READY_PIXEL_RGB"]:
                 is_ready = True
-                status_update(f"就绪！仅耗时 {polled_time:.1f}s 提前切入！")
-                time.sleep(0.2) # 确认就绪后的视觉过渡
+                status_update(f"界面就绪！强制缓冲 0.5s 等待标题文本刷出...")
+                time.sleep(0.5) 
                 break
-                
             time.sleep(0.1)
             polled_time += 0.1
             
         if not is_ready and is_running_auto:
-            status_update("超时 12s 触发熔断，视为系统异常或无数据，跳过")
+            status_update("超时 12s 未变白，触发熔断，切下一行")
             continue
             
-        if not is_running_auto: break # 二次防阻断检测
+        if not is_running_auto: break 
 
-        # --- 动作 4: 屏幕读取与匹配 (策略 A: 熔断跳过) ---
+        # --- 动作 3.5: 防遮挡/破障点击 ---
+        # 击碎残留的列表UI，并预夺焦点
+        mouse_click(*RPA_CONFIG["AREA_SAFE_BLANK"])
+        time.sleep(0.5)
+
+        # --- 动作 4: 屏幕读取与匹配 ---
         hwnd = user32.GetForegroundWindow()
         length = user32.GetWindowTextLengthW(hwnd)
         buff = ctypes.create_unicode_buffer(length + 1)
@@ -143,23 +160,18 @@ def start_automation_flow(loop_count):
         
         if not target_p:
             conn.close()
-            status_update(f"【跳过】未在数据库匹配到当前窗口患者")
+            status_update(f"【跳过】当前床位未在数据库中建档")
             continue
 
-        # --- 动作 5: 极速自动化点击与注入 ---
-        # 焦点重置 (延时 1s)
-        mouse_click(*RPA_CONFIG["AREA_PROGRESS_RECORD"])
+        # --- 动作 5: 极速触发展开菜单 ---
+        mouse_double_click(*RPA_CONFIG["AREA_PROGRESS_RECORD"])
         time.sleep(1.0)
         
-        # 触发新建 (无延迟)
-        mouse_click(*RPA_CONFIG["BTN_NEW_RECORD"])
-        time.sleep(0.3) # 给菜单弹出一个渲染微秒
-        
-        # 挂载模板 (延时 1s)
+        # --- 动作 6: 挂载模板 ---
         mouse_double_click(*RPA_CONFIG["TPL_OPTION"])
         time.sleep(1.0)
         
-        # 提取数据并组装
+        # --- 动作 7: 提取数据并组装 ---
         cursor.execute("SELECT content FROM templates WHERE name=?", (locked_tpl_name,))
         tpl_data = cursor.fetchone()
         conn.close()
@@ -174,7 +186,7 @@ def start_automation_flow(loop_count):
         final_text = final_text.replace("{{admit_diag}}", str(target_p[6]))
         final_text = final_text.replace("{{current_diag}}", str(target_p[7]))
         
-        # 渲染与注入
+        # 渲染与注入剪贴板
         pyperclip.copy(final_text)
         time.sleep(0.3)
         user32.keybd_event(0x11, 0, 0, 0) # Ctrl
@@ -182,18 +194,21 @@ def start_automation_flow(loop_count):
         user32.keybd_event(0x56, 0, 2, 0)
         user32.keybd_event(0x11, 0, 2, 0)
         
-        time.sleep(0.5) # 文本打入缓冲
+        time.sleep(0.5) 
         
-        # 归档提交 (F3)
+        # --- 动作 8: 归档提交 (F3) ---
         user32.keybd_event(0x72, 0, 0, 0) 
         user32.keybd_event(0x72, 0, 2, 0)
         
         status_update(f"【归档成功】患者: {target_p[1]}")
-        time.sleep(2) # 闭环等待 HIS 保存写入
+        time.sleep(2) 
 
     is_running_auto = False
-    status_update("--- 极速流水线执行结束，请进行人工复核 ---")
-    messagebox.showinfo("流水线终止", "任务已处理完毕。")
+    status_update("--- 极速流水线执行结束 ---")
+    
+    # 任务完成，自动从任务栏恢复辅助程序界面
+    root.deiconify() 
+    messagebox.showinfo("流水线终止", "分配的行数扫描与写入已全部执行完毕。")
 
 # ==================== 4. 界面交互与 CRUD ====================
 def status_update(msg):
@@ -203,6 +218,7 @@ def stop_auto():
     global is_running_auto
     is_running_auto = False
     status_update("【阻断响应】正在安全终止进程...")
+    root.deiconify() # 若中途停止，立刻恢复界面
 
 def run_thread():
     try:
@@ -210,12 +226,15 @@ def run_thread():
         if not locked_tpl_name:
             messagebox.showwarning("拦截", "请先在工作台锁定所需套用的模板！")
             return
-        status_update("流水线将于 3 秒后启动，请切至 HIS 全屏...")
+        status_update("程序将自动隐藏，3 秒后接管 HIS...")
         root.update()
         time.sleep(3)
+        
+        # 核心：启动 RPA 前，自动将本程序最小化至任务栏，彻底消除遮挡
+        root.iconify() 
         threading.Thread(target=start_automation_flow, args=(count,), daemon=True).start()
     except ValueError:
-        messagebox.showerror("参数异常", "请输入整数循环次数。")
+        messagebox.showerror("参数异常", "请输入整数行数。")
 
 def on_tpl_select(event):
     global locked_tpl_name
@@ -300,9 +319,8 @@ def setup_ui():
     global mgr_tree, mgr_tpl_listbox, p_bed, p_name, p_gender, p_age, p_admit, p_comp, p_adiag, p_cdiag, tpl_name_entry, tpl_content_text
 
     root = tk.Tk()
-    root.title("轻量级精神科极速自动化工作站 (闭环轮询版)")
+    root.title("轻量级精神科极速自动化工作站 (V5.2)")
     root.geometry("850x550")
-    root.attributes('-topmost', True) 
 
     notebook = ttk.Notebook(root)
     notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -323,20 +341,22 @@ def setup_ui():
     tk.Label(center_frame, text="2. 极速流水线作业配置", font=("Arial", 11, "bold")).pack(pady=10)
     loop_fm = tk.Frame(center_frame)
     loop_fm.pack()
-    tk.Label(loop_fm, text="预计批量处理床位数:").pack(side=tk.LEFT)
+    tk.Label(loop_fm, text="向下需扫描的列表总行数 (含空床):").pack(side=tk.LEFT)
     loop_entry = tk.Entry(loop_fm, width=10, justify='center')
-    loop_entry.insert(0, "1") 
+    loop_entry.insert(0, "4") 
     loop_entry.pack(side=tk.LEFT, padx=5)
     
     btn_fm = tk.Frame(center_frame)
     btn_fm.pack(pady=15)
     tk.Button(btn_fm, text="▶ 启动极速引擎", bg="#dff0d8", command=run_thread, width=25, height=2).pack(side=tk.LEFT, padx=10)
+    
+    # 调整急停策略提示：程序运行时在后台，如需停止需手动点击任务栏恢复窗口再停止
     tk.Button(btn_fm, text="🛑 强制急停", bg="#f2dede", command=stop_auto, width=15, height=2).pack(side=tk.LEFT, padx=10)
     
-    status_label = tk.Label(center_frame, text="系统已就绪，采用 RGB 闭环轮询模式", fg="green", font=("Arial", 10))
+    status_label = tk.Label(center_frame, text="系统已就绪，就绪后程序将自动最小化防遮挡", fg="green", font=("Arial", 10))
     status_label.pack(pady=10)
 
-    # ---------- Tab 2 & 3: 数据管理 (与旧版相同) ----------
+    # ---------- Tab 2 & 3: 数据管理 (保持不变) ----------
     tab_pmgr = ttk.Frame(notebook)
     notebook.add(tab_pmgr, text="⚙️ 患者管理台")
     pmgr_left = tk.Frame(tab_pmgr)
