@@ -7,16 +7,16 @@ import ctypes.wintypes
 import threading
 import time
 
-# [核心防御] 强制系统 DPI 感知，确保绝对物理像素对齐
+# [核心防御] 强制系统 DPI 感知，确保绝对物理像素对齐，无视 Windows 缩放
 try:
     ctypes.windll.user32.SetProcessDPIAware()
 except AttributeError:
     pass
 
-# ==================== RPA 物理锚点配置 ====================
+# ==================== RPA 物理锚点配置 (基于实地雷达测绘) ====================
 RPA_CONFIG = {
-    "BTN_SWITCH_PATIENT": (32, 96),      
-    "PATIENT_FIRST_ROW": (86, 215),      
+    "BTN_SWITCH_PATIENT": (32, 96),      # 1. 切换病人按钮 
+    "PATIENT_FIRST_ROW": (86, 215),      # 2. 病人列表首行
     "LINE_HEIGHT": 18,                   
     
     # --- 无极轮询配置 ---
@@ -24,9 +24,9 @@ RPA_CONFIG = {
     "READY_PIXEL_RGB": (245, 245, 245),  
     
     # --- UI 破障与交互配置 ---
-    "AREA_SAFE_BLANK": (500, 642),       
-    "AREA_PROGRESS_RECORD": (60, 267),   
-    "TPL_OPTION": (825, 370),            
+    "AREA_SAFE_BLANK": (500, 642),       # 纯空白安全区
+    "AREA_PROGRESS_RECORD": (60, 267),   # 病程记录区 (双击唤醒菜单)
+    "TPL_OPTION": (825, 370),            # 二级菜单具体模板 
 }
 
 DB_FILE = "his_data.db"
@@ -39,8 +39,8 @@ gdi32 = ctypes.windll.gdi32
 
 def mouse_click(x, y):
     user32.SetCursorPos(x, y)
-    user32.mouse_event(2, 0, 0, 0, 0)
-    user32.mouse_event(4, 0, 0, 0, 0)
+    user32.mouse_event(2, 0, 0, 0, 0) # 左键按下
+    user32.mouse_event(4, 0, 0, 0, 0) # 左键抬起
 
 def mouse_double_click(x, y):
     mouse_click(x, y)
@@ -84,29 +84,29 @@ def refresh_all_data():
         mgr_tpl_listbox.insert(tk.END, row[0])
     conn.close()
 
-# ==================== 3. 核心全自动逻辑引擎 (支持断点续传) ====================
+# ==================== 3. 核心全自动逻辑引擎 (V5.5) ====================
 def start_automation_flow(start_row, loop_count):
     global is_running_auto, locked_tpl_name
     is_running_auto = True
     
-    start_index = start_row - 1 # 转换为0基索引用于坐标乘法计算
+    start_index = start_row - 1 
     
     for i in range(loop_count):
         if not is_running_auto: break 
         
         current_processing_row = start_row + i
-        status_update(f"正在扫描第 {current_processing_row} 行列表 (进度: {i+1}/{loop_count})...")
+        status_update(f"正在扫描第 {current_processing_row} 行 (进度: {i+1}/{loop_count})...")
         
         # --- 动作 1: 唤醒列表 ---
         mouse_click(*RPA_CONFIG["BTN_SWITCH_PATIENT"])
         time.sleep(0.2) 
         
-        # --- 动作 2: 精确寻址切换 (引入偏移量) ---
+        # --- 动作 2: 精确寻址切换 ---
         target_y = RPA_CONFIG["PATIENT_FIRST_ROW"][1] + ((start_index + i) * RPA_CONFIG["LINE_HEIGHT"])
         mouse_double_click(RPA_CONFIG["PATIENT_FIRST_ROW"][0], target_y)
         
         # --- 动作 3: 无极闭环轮询 ---
-        status_update(f"第 {current_processing_row} 行: 等待系统复苏 (阻塞侦测)...")
+        status_update(f"第 {current_processing_row} 行: 等待复苏...")
         
         busy_check = 0.0
         while busy_check < 5.0:
@@ -117,15 +117,14 @@ def start_automation_flow(start_row, loop_count):
             busy_check += 0.2
             
         while is_running_auto:
-            current_rgb = get_pixel_color(*RPA_CONFIG["READY_PIXEL_POS"])
-            if current_rgb == RPA_CONFIG["READY_PIXEL_RGB"]:
+            if get_pixel_color(*RPA_CONFIG["READY_PIXEL_POS"]) == RPA_CONFIG["READY_PIXEL_RGB"]:
                 time.sleep(0.8) 
                 break
             time.sleep(0.3) 
 
         if not is_running_auto: break 
 
-        # --- 动作 3.5: 破障点击 ---
+        # --- 动作 3.5: 破障点击 (安全区) ---
         mouse_click(*RPA_CONFIG["AREA_SAFE_BLANK"])
         time.sleep(0.5)
 
@@ -166,18 +165,21 @@ def start_automation_flow(start_row, loop_count):
         if not tpl_data: continue
         final_text = tpl_data[0].replace("{{name}}", str(target_p[1])).replace("{{gender}}", str(target_p[2])).replace("{{age}}", str(target_p[3])).replace("{{admit_date}}", str(target_p[4])).replace("{{complaint}}", str(target_p[5])).replace("{{admit_diag}}", str(target_p[6])).replace("{{current_diag}}", str(target_p[7]))
         
+        # Ctrl+V 粘贴
         pyperclip.copy(final_text)
         time.sleep(0.4)
-        user32.keybd_event(0x11, 0, 0, 0) 
-        user32.keybd_event(0x56, 0, 0, 0) 
+        user32.keybd_event(0x11, 0, 0, 0) # Ctrl
+        user32.keybd_event(0x56, 0, 0, 0) # V
         user32.keybd_event(0x56, 0, 2, 0)
         user32.keybd_event(0x11, 0, 2, 0)
         
         time.sleep(0.8) 
         
-        # F3 保存
-        user32.keybd_event(0x72, 0, 0, 0) 
-        user32.keybd_event(0x72, 0, 2, 0)
+        # --- 动作 8: 归档提交 (已修改为 Ctrl + S) ---
+        user32.keybd_event(0x11, 0, 0, 0) # Ctrl 按下
+        user32.keybd_event(0x53, 0, 0, 0) # S 按下
+        user32.keybd_event(0x53, 0, 2, 0) # S 释放
+        user32.keybd_event(0x11, 0, 2, 0) # Ctrl 释放
         
         status_update(f"【成功】已归档: {target_p[1]}")
         time.sleep(2.5) 
@@ -187,7 +189,7 @@ def start_automation_flow(start_row, loop_count):
     root.deiconify() 
     messagebox.showinfo("任务完成", "流水线已处理完毕。")
 
-# ==================== 4. UI 交互 ====================
+# ==================== 4. UI 交互层 ====================
 def status_update(msg):
     status_label.config(text=msg)
 
@@ -201,16 +203,13 @@ def run_thread():
     try:
         start_row = int(start_entry.get())
         count = int(loop_entry.get())
-        
         if start_row < 1 or count < 1:
-            messagebox.showerror("参数异常", "起始行和扫描行数必须为 ≥1 的正整数。")
+            messagebox.showerror("参数异常", "请输入 ≥1 的正整数。")
             return
-            
         if not locked_tpl_name:
             messagebox.showwarning("拦截", "请先锁定模板！")
             return
-            
-        status_update("3 秒后自动隐藏并启动...")
+        status_update("程序将自动隐藏，3 秒后接管 HIS...")
         root.update()
         time.sleep(3)
         root.iconify() 
@@ -238,7 +237,7 @@ def toggle_lock():
     else:
         status_label.config(text="状态: 挂载解除", fg="gray")
 
-# CRUD 逻辑保留
+# 数据库 CRUD 保留
 def save_patient():
     data = (p_bed.get(), p_name.get(), p_gender.get(), p_age.get(), p_admit.get(), p_comp.get(), p_adiag.get(), p_cdiag.get())
     if not data[0] or not data[1]: return
@@ -282,26 +281,19 @@ def on_template_select(event):
 
 def setup_ui():
     global tpl_listbox, status_label, loop_entry, start_entry, lock_var, root, mgr_tree, mgr_tpl_listbox, p_bed, p_name, p_gender, p_age, p_admit, p_comp, p_adiag, p_cdiag, tpl_name_entry, tpl_content_text
-    root = tk.Tk(); root.title("轻量级精神科工作站 V5.4 (断点续传版)"); root.geometry("850x550")
+    root = tk.Tk(); root.title("极速精神科工作站 V5.5 (全自动交付版)"); root.geometry("850x550")
     nb = ttk.Notebook(root); nb.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-    
-    # 极速引擎 Tab
     tab1 = ttk.Frame(nb); nb.add(tab1, text="🚀 极速引擎")
     cf = tk.Frame(tab1); cf.pack(fill=tk.BOTH, expand=True, padx=40, pady=20)
     tpl_listbox = tk.Listbox(cf, height=6, font=("Arial", 11)); tpl_listbox.pack(fill=tk.X); tpl_listbox.bind('<<ListboxSelect>>', on_tpl_select)
     lock_var = tk.BooleanVar(); tk.Checkbutton(cf, text="🔒 锁定模板", variable=lock_var, command=toggle_lock).pack(pady=5)
-    
-    # 双变量输入区
     lf = tk.Frame(cf); lf.pack(pady=5)
     tk.Label(lf, text="起始向下扫描行:").pack(side=tk.LEFT)
     start_entry = tk.Entry(lf, width=8, justify='center'); start_entry.insert(0, "1"); start_entry.pack(side=tk.LEFT, padx=5)
     tk.Label(lf, text="连续扫描总行数:").pack(side=tk.LEFT, padx=(15, 0))
     loop_entry = tk.Entry(lf, width=8, justify='center'); loop_entry.insert(0, "4"); loop_entry.pack(side=tk.LEFT, padx=5)
-    
-    bf = tk.Frame(cf); bf.pack(pady=15); tk.Button(bf, text="▶ 启动 (阻塞侦测模式)", bg="#dff0d8", command=run_thread, width=25, height=2).pack(side=tk.LEFT, padx=10); tk.Button(bf, text="🛑 急停", bg="#f2dede", command=stop_auto, width=15, height=2).pack(side=tk.LEFT, padx=10)
-    status_label = tk.Label(cf, text="等待指令...", fg="green", font=("Arial", 10)); status_label.pack(pady=10)
-    
-    # 患者与模板管理 Tab 保持原样
+    bf = tk.Frame(cf); bf.pack(pady=15); tk.Button(bf, text="▶ 启动 (Ctrl+S 提交模式)", bg="#dff0d8", command=run_thread, width=25, height=2).pack(side=tk.LEFT, padx=10); tk.Button(bf, text="🛑 急停", bg="#f2dede", command=stop_auto, width=15, height=2).pack(side=tk.LEFT, padx=10)
+    status_label = tk.Label(cf, text="就绪。归档键已改为 Ctrl+S", fg="green", font=("Arial", 10)); status_label.pack(pady=10)
     tab2 = ttk.Frame(nb); nb.add(tab2, text="⚙️ 患者管理"); p_left = tk.Frame(tab2); p_left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
     cols = ("bed", "name", "gender", "age", "admit_date", "complaint"); mgr_tree = ttk.Treeview(p_left, columns=cols, show="headings"); [mgr_tree.heading(c, text=t) or mgr_tree.column(c, width=60) for c, t in zip(cols, ["床号", "姓名", "性别", "年龄", "入院日", "主诉"])]; mgr_tree.pack(fill=tk.BOTH, expand=True); mgr_tree.bind('<<TreeviewSelect>>', on_patient_select)
     p_right = tk.Frame(tab2, width=280); p_right.pack(side=tk.RIGHT, fill=tk.Y, padx=10, pady=10); fds = [("床号:", "p_bed"), ("姓名:", "p_name"), ("性别:", "p_gender"), ("年龄:", "p_age"), ("入院日期:", "p_admit"), ("主诉摘要:", "p_comp"), ("入院诊断:", "p_adiag"), ("目前诊断:", "p_cdiag")]; entries = []
@@ -309,7 +301,6 @@ def setup_ui():
     p_bed, p_name, p_gender, p_age, p_admit, p_comp, p_adiag, p_cdiag = entries; tk.Button(p_right, text="保存", command=save_patient, bg="#dff0d8").grid(row=10, column=0, columnspan=2, sticky=tk.EW, pady=10); tk.Button(p_right, text="删除", command=delete_patient, bg="#f2dede").grid(row=11, column=0, columnspan=2, sticky=tk.EW)
     tab3 = ttk.Frame(nb); nb.add(tab3, text="📝 模板管理"); t_left = tk.Frame(tab3, width=180); t_left.pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=5); mgr_tpl_listbox = tk.Listbox(t_left); mgr_tpl_listbox.pack(fill=tk.BOTH, expand=True); mgr_tpl_listbox.bind('<<ListboxSelect>>', on_template_select); tk.Button(t_left, text="删除", command=delete_template, bg="#f2dede").pack(fill=tk.X, pady=5)
     t_right = tk.Frame(tab3); t_right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=5, pady=5); tpl_name_entry = tk.Entry(t_right); tpl_name_entry.pack(fill=tk.X, pady=2); tpl_content_text = tk.Text(t_right); tpl_content_text.pack(fill=tk.BOTH, expand=True, pady=5); tk.Button(t_right, text="保存", command=save_template, bg="#dff0d8", height=2).pack(fill=tk.X)
-    
     refresh_all_data(); root.mainloop()
 
 if __name__ == "__main__":
