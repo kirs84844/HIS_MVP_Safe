@@ -14,7 +14,7 @@ try:
 except AttributeError:
     pass
 
-# ==================== RPA 物理锚点配置 (V5.7) ====================
+# ==================== RPA 物理锚点配置 (V5.8) ====================
 RPA_CONFIG = {
     "BTN_SWITCH_PATIENT": (32, 96),      
     "PATIENT_FIRST_ROW": (86, 215),      
@@ -24,10 +24,10 @@ RPA_CONFIG = {
     "READY_PIXEL_RGB": (245, 245, 245),  
     "AREA_SAFE_BLANK": (500, 642),       
     
-    # --- V5.7 更新物理锚点 ---
-    "BTN_NEW_RECORD": (240, 80),         # 5. 单击此处唤起模板二级菜单
-    "AREA_TEXT_FOCUS": (60, 267),        # 病程正文区 (用于劫持时间后强行拉回光标)
-    "TPL_OPTION": (825, 370),            # 模板列表具体位置
+    # --- V5.8 核心修改锚点 ---
+    "AREA_PROGRESS_RECORD": (60, 267),   # 1. 预定焦点区 (先单击此处)
+    "BTN_NEW_RECORD": (240, 80),         # 2. 新建按钮 (再单击此处)
+    "TPL_OPTION": (825, 370),            # 3. 模板列表具体位置
 }
 
 DB_FILE = "his_data.db"
@@ -85,7 +85,7 @@ def refresh_all_data():
         mgr_tpl_listbox.insert(tk.END, row[0])
     conn.close()
 
-# ==================== 3. 核心全自动逻辑引擎 (V5.7) ====================
+# ==================== 3. 核心全自动逻辑引擎 (V5.8) ====================
 def start_automation_flow(start_row, loop_count, target_time_obj):
     global is_running_auto, locked_tpl_name
     is_running_auto = True
@@ -148,7 +148,9 @@ def start_automation_flow(start_row, loop_count, target_time_obj):
             status_update(f"【跳过】行 {current_processing_row} 未建档")
             continue
 
-        # --- 动作 5: 【V5.7修改】单击新建按钮唤醒二级菜单 ---
+        # --- 动作 5: 【V5.8修改】先预点击夺取焦点，再点击新建 ---
+        mouse_click(*RPA_CONFIG["AREA_PROGRESS_RECORD"])
+        time.sleep(0.3)  # 给 HIS 系统 0.3 秒的焦点渲染时间
         mouse_click(*RPA_CONFIG["BTN_NEW_RECORD"])
         time.sleep(1.2) 
         
@@ -187,7 +189,7 @@ def start_automation_flow(start_row, loop_count, target_time_obj):
             time.sleep(1.2)
             
             # 【托底防御】强行点击正文区，防止焦点遗落在时间框
-            mouse_click(*RPA_CONFIG["AREA_TEXT_FOCUS"])
+            mouse_click(*RPA_CONFIG["AREA_PROGRESS_RECORD"])
             time.sleep(0.3)
             
         else:
@@ -336,7 +338,7 @@ def setup_ui():
     global tpl_listbox, status_label, loop_entry, start_entry, lock_var, root, mgr_tree, mgr_tpl_listbox, p_bed, p_name, p_gender, p_age, p_admit, p_comp, p_adiag, p_cdiag, tpl_name_entry, tpl_content_text
     global time_var, time_entry
     
-    root = tk.Tk(); root.title("极速精神科工作站 V5.7"); root.geometry("850x600")
+    root = tk.Tk(); root.title("极速精神科工作站 V5.8"); root.geometry("850x600")
     nb = ttk.Notebook(root); nb.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
     tab1 = ttk.Frame(nb); nb.add(tab1, text="🚀 极速引擎")
     cf = tk.Frame(tab1); cf.pack(fill=tk.BOTH, expand=True, padx=40, pady=20)
