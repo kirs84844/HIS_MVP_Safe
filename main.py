@@ -14,7 +14,7 @@ try:
 except AttributeError:
     pass
 
-# ==================== RPA 物理锚点配置 ====================
+# ==================== RPA 物理锚点配置 (V5.7) ====================
 RPA_CONFIG = {
     "BTN_SWITCH_PATIENT": (32, 96),      
     "PATIENT_FIRST_ROW": (86, 215),      
@@ -22,10 +22,12 @@ RPA_CONFIG = {
     
     "READY_PIXEL_POS": (28, 95),         
     "READY_PIXEL_RGB": (245, 245, 245),  
-    
     "AREA_SAFE_BLANK": (500, 642),       
-    "AREA_PROGRESS_RECORD": (60, 267),   
-    "TPL_OPTION": (825, 370),            
+    
+    # --- V5.7 更新物理锚点 ---
+    "BTN_NEW_RECORD": (240, 80),         # 5. 单击此处唤起模板二级菜单
+    "AREA_TEXT_FOCUS": (60, 267),        # 病程正文区 (用于劫持时间后强行拉回光标)
+    "TPL_OPTION": (825, 370),            # 模板列表具体位置
 }
 
 DB_FILE = "his_data.db"
@@ -83,7 +85,7 @@ def refresh_all_data():
         mgr_tpl_listbox.insert(tk.END, row[0])
     conn.close()
 
-# ==================== 3. 核心全自动逻辑引擎 (V5.6) ====================
+# ==================== 3. 核心全自动逻辑引擎 (V5.7) ====================
 def start_automation_flow(start_row, loop_count, target_time_obj):
     global is_running_auto, locked_tpl_name
     is_running_auto = True
@@ -146,8 +148,8 @@ def start_automation_flow(start_row, loop_count, target_time_obj):
             status_update(f"【跳过】行 {current_processing_row} 未建档")
             continue
 
-        # --- 动作 5: 唤醒二级菜单 ---
-        mouse_double_click(*RPA_CONFIG["AREA_PROGRESS_RECORD"])
+        # --- 动作 5: 【V5.7修改】单击新建按钮唤醒二级菜单 ---
+        mouse_click(*RPA_CONFIG["BTN_NEW_RECORD"])
         time.sleep(1.2) 
         
         # ==================== 核心分流控制 ====================
@@ -182,12 +184,16 @@ def start_automation_flow(start_row, loop_count, target_time_obj):
             
             # Enter 确认生成
             user32.keybd_event(0x0D, 0, 0, 0); user32.keybd_event(0x0D, 0, 2, 0)
-            time.sleep(1.2) # 与路径 A 保持一致的编辑器加载时间
+            time.sleep(1.2)
+            
+            # 【托底防御】强行点击正文区，防止焦点遗落在时间框
+            mouse_click(*RPA_CONFIG["AREA_TEXT_FOCUS"])
+            time.sleep(0.3)
             
         else:
             # 【路径 A: 默认常规模式】
             mouse_double_click(*RPA_CONFIG["TPL_OPTION"])
-            time.sleep(1.2) # 与路径 B 保持一致的编辑器加载时间
+            time.sleep(1.2) 
         # ========================================================
 
         # --- 动作 7: 数据提取与注入正文 ---
@@ -251,7 +257,6 @@ def run_thread():
         if time_var.get():
             time_str = time_entry.get().strip()
             try:
-                # 严格按照 YY-MM-DD HH:MM 格式解析
                 target_time_obj = datetime.strptime(time_str, "%y-%m-%d %H:%M")
             except ValueError:
                 messagebox.showerror("格式阻断", "时间格式存在瑕疵！\n请严格遵循: YY-MM-DD HH:MM\n(示例: 26-04-26 10:00)")
@@ -285,7 +290,7 @@ def toggle_lock():
     else:
         status_label.config(text="状态: 挂载解除", fg="gray")
 
-# 数据库 CRUD 保留
+# 数据库 CRUD 
 def save_patient():
     data = (p_bed.get(), p_name.get(), p_gender.get(), p_age.get(), p_admit.get(), p_comp.get(), p_adiag.get(), p_cdiag.get())
     if not data[0] or not data[1]: return
@@ -331,7 +336,7 @@ def setup_ui():
     global tpl_listbox, status_label, loop_entry, start_entry, lock_var, root, mgr_tree, mgr_tpl_listbox, p_bed, p_name, p_gender, p_age, p_admit, p_comp, p_adiag, p_cdiag, tpl_name_entry, tpl_content_text
     global time_var, time_entry
     
-    root = tk.Tk(); root.title("极速精神科工作站 V5.6 (自适应双规模式)"); root.geometry("850x600")
+    root = tk.Tk(); root.title("极速精神科工作站 V5.7"); root.geometry("850x600")
     nb = ttk.Notebook(root); nb.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
     tab1 = ttk.Frame(nb); nb.add(tab1, text="🚀 极速引擎")
     cf = tk.Frame(tab1); cf.pack(fill=tk.BOTH, expand=True, padx=40, pady=20)
@@ -353,7 +358,7 @@ def setup_ui():
     tk.Label(lf, text="连续扫描总行数:").pack(side=tk.LEFT, padx=(15, 0))
     loop_entry = tk.Entry(lf, width=8, justify='center'); loop_entry.insert(0, "4"); loop_entry.pack(side=tk.LEFT, padx=5)
     bf = tk.Frame(cf); bf.pack(pady=10); tk.Button(bf, text="▶ 启动执行流", bg="#dff0d8", command=run_thread, width=25, height=2).pack(side=tk.LEFT, padx=10); tk.Button(bf, text="🛑 急停", bg="#f2dede", command=stop_auto, width=15, height=2).pack(side=tk.LEFT, padx=10)
-    status_label = tk.Label(cf, text="就绪。按需勾选时间覆写机制", fg="green", font=("Arial", 10)); status_label.pack(pady=5)
+    status_label = tk.Label(cf, text="就绪。", fg="green", font=("Arial", 10)); status_label.pack(pady=5)
     
     tab2 = ttk.Frame(nb); nb.add(tab2, text="⚙️ 患者管理"); p_left = tk.Frame(tab2); p_left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
     cols = ("bed", "name", "gender", "age", "admit_date", "complaint"); mgr_tree = ttk.Treeview(p_left, columns=cols, show="headings"); [mgr_tree.heading(c, text=t) or mgr_tree.column(c, width=60) for c, t in zip(cols, ["床号", "姓名", "性别", "年龄", "入院日", "主诉"])]; mgr_tree.pack(fill=tk.BOTH, expand=True); mgr_tree.bind('<<TreeviewSelect>>', on_patient_select)
