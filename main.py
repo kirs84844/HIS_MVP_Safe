@@ -33,6 +33,24 @@ RPA_CONFIG = {
 DB_FILE = "his_data.db"
 is_running_auto = False
 locked_tpl_name = ""
+WORD_TEMPLATE_NAME = "中医会诊单"
+WORD_DEPARTMENT = "浦二"
+WORD_FIXED_ADMIT_DATE = "2022.9.20"
+WORD_PAGE_BREAK = "\f"
+DEFAULT_WORD_TEMPLATE = """会诊请求
+拟请科室：  中医科                     2026 年  6月 30 日
+患者姓名：{{name}}   性别：{{gender}}  年龄：{{age}}  科室：{{department}}   床号：{{bed}}
+诊断：{{diagnosis}}
+病情摘要：患者主因 “{{complaint}}”于{{admit_date}}入院，目前精神检查：意识清，定向可，仪态尚整，注意力集中，接触合作，对答切题，未引出明显幻觉、妄想，思维贫乏，情感反应淡漠，意志要求减退，智能可，自知力无。
+目前体格检查：暂无阳性症状。
+会诊目的：请中医科协助治疗。
+
+请求科室：{{department}}    医师：李晗       主治医师：高一鸣
+                                                                 
+会诊意见:
+
+                         
+"""
 
 # ==================== 1. 硬件模拟引擎 ====================
 user32 = ctypes.windll.user32
@@ -67,6 +85,9 @@ def init_db():
                         admit_diag TEXT, current_diag TEXT)''')
     cursor.execute('''CREATE TABLE IF NOT EXISTS templates (
                         name TEXT PRIMARY KEY, content TEXT)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS word_templates (
+                        name TEXT PRIMARY KEY, content TEXT)''')
+    cursor.execute("INSERT OR IGNORE INTO word_templates VALUES (?,?)", (WORD_TEMPLATE_NAME, DEFAULT_WORD_TEMPLATE))
     conn.commit()
     conn.close()
 
@@ -191,6 +212,10 @@ def start_automation_flow(start_row, loop_count, target_time_obj):
             # 【托底防御】强行点击正文区，防止焦点遗落在时间框
             mouse_click(*RPA_CONFIG["AREA_PROGRESS_RECORD"])
             time.sleep(0.3)
+
+            # 二次确认编辑区焦点，防止历史时间模式下正文注入前光标未落位
+            user32.keybd_event(0x0D, 0, 0, 0); user32.keybd_event(0x0D, 0, 2, 0)
+            time.sleep(0.2)
             
         else:
             # 【路径 A: 默认常规模式】
@@ -334,8 +359,88 @@ def on_template_select(event):
     tpl_name_entry.delete(0, tk.END); tpl_name_entry.insert(0, mgr_tpl_listbox.get(selected))
     tpl_content_text.delete("1.0", tk.END); tpl_content_text.insert(tk.END, content)
 
+def save_word_template():
+    content = word_template_text.get("1.0", tk.END).strip()
+    if not content:
+        messagebox.showwarning("拦截", "会诊单模板不能为空。")
+        return
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("REPLACE INTO word_templates VALUES (?,?)", (WORD_TEMPLATE_NAME, content))
+    conn.commit()
+    conn.close()
+    word_status_label.config(text="会诊单模板已保存。", fg="blue")
+
+def load_word_template():
+    conn = sqlite3.connect(DB_FILE)
+    row = conn.execute("SELECT content FROM word_templates WHERE name=?", (WORD_TEMPLATE_NAME,)).fetchone()
+    conn.close()
+    word_template_text.delete("1.0", tk.END)
+    word_template_text.insert(tk.END, row[0] if row else DEFAULT_WORD_TEMPLATE)
+
+def patient_sort_key(row):
+    bed = str(row[0])
+    return (int(bed) if bed.isdigit() else 9999, bed)
+
+def clean_text(value):
+    if value is None or value == "None":
+        return ""
+    return str(value)
+
+def fetch_word_patients(start_bed, count):
+    conn = sqlite3.connect(DB_FILE)
+    patients = conn.execute("SELECT * FROM patients").fetchall()
+    conn.close()
+    patients = sorted(patients, key=patient_sort_key)
+    if start_bed:
+        patients = [p for p in patients if patient_sort_key(p) >= patient_sort_key((start_bed,))]
+    if count:
+        patients = patients[:count]
+    return patients
+
+def render_word_page(template, patient):
+    values = {
+        "bed": clean_text(patient[0]),
+        "name": clean_text(patient[1]),
+        "gender": clean_text(patient[2]),
+        "age": clean_text(patient[3]),
+        "department": WORD_DEPARTMENT,
+        "diagnosis": clean_text(patient[7]),
+        "complaint": clean_text(patient[5]),
+        "admit_date": WORD_FIXED_ADMIT_DATE,
+    }
+    for key, value in values.items():
+        template = template.replace("{{" + key + "}}", value)
+    return template.strip()
+
+def copy_word_consult_text(event=None):
+    try:
+        start_bed = word_start_entry.get().strip()
+        count_text = word_count_entry.get().strip()
+        count = int(count_text) if count_text else None
+        if count is not None and count < 1:
+            messagebox.showerror("参数异常", "生成人数必须为空或 ≥1。")
+            return
+    except ValueError:
+        messagebox.showerror("参数错误", "生成人数请输入有效数字，或留空。")
+        return
+
+    template = word_template_text.get("1.0", tk.END).strip()
+    if not template:
+        messagebox.showwarning("拦截", "会诊单模板不能为空。")
+        return
+
+    patients = fetch_word_patients(start_bed, count)
+    if not patients:
+        messagebox.showwarning("无数据", "未找到符合床号条件的患者。")
+        return
+
+    pages = [render_word_page(template, patient) for patient in patients]
+    pyperclip.copy(WORD_PAGE_BREAK.join(pages))
+    word_status_label.config(text=f"已复制 {len(pages)} 页会诊单。请切换到 Word 97-2003 后粘贴。", fg="green")
+
 def setup_ui():
     global tpl_listbox, status_label, loop_entry, start_entry, lock_var, root, mgr_tree, mgr_tpl_listbox, p_bed, p_name, p_gender, p_age, p_admit, p_comp, p_adiag, p_cdiag, tpl_name_entry, tpl_content_text
+    global word_start_entry, word_count_entry, word_template_text, word_status_label
     global time_var, time_entry
     
     root = tk.Tk(); root.title("极速精神科工作站 V5.8"); root.geometry("850x600")
@@ -369,6 +474,20 @@ def setup_ui():
     p_bed, p_name, p_gender, p_age, p_admit, p_comp, p_adiag, p_cdiag = entries; tk.Button(p_right, text="保存", command=save_patient, bg="#dff0d8").grid(row=10, column=0, columnspan=2, sticky=tk.EW, pady=10); tk.Button(p_right, text="删除", command=delete_patient, bg="#f2dede").grid(row=11, column=0, columnspan=2, sticky=tk.EW)
     tab3 = ttk.Frame(nb); nb.add(tab3, text="📝 模板管理"); t_left = tk.Frame(tab3, width=180); t_left.pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=5); mgr_tpl_listbox = tk.Listbox(t_left); mgr_tpl_listbox.pack(fill=tk.BOTH, expand=True); mgr_tpl_listbox.bind('<<ListboxSelect>>', on_template_select); tk.Button(t_left, text="删除", command=delete_template, bg="#f2dede").pack(fill=tk.X, pady=5)
     t_right = tk.Frame(tab3); t_right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=5, pady=5); tpl_name_entry = tk.Entry(t_right); tpl_name_entry.pack(fill=tk.X, pady=2); tpl_content_text = tk.Text(t_right); tpl_content_text.pack(fill=tk.BOTH, expand=True, pady=5); tk.Button(t_right, text="保存", command=save_template, bg="#dff0d8", height=2).pack(fill=tk.X)
+    tab4 = ttk.Frame(nb); nb.add(tab4, text="📄 会诊单复制")
+    w_top = tk.Frame(tab4); w_top.pack(fill=tk.X, padx=12, pady=8)
+    tk.Label(w_top, text="起始床号:").pack(side=tk.LEFT)
+    word_start_entry = tk.Entry(w_top, width=8, justify='center'); word_start_entry.pack(side=tk.LEFT, padx=5)
+    tk.Label(w_top, text="生成人数:").pack(side=tk.LEFT, padx=(15, 0))
+    word_count_entry = tk.Entry(w_top, width=8, justify='center'); word_count_entry.pack(side=tk.LEFT, padx=5)
+    tk.Button(w_top, text="生成并复制 (F1)", command=copy_word_consult_text, bg="#dff0d8").pack(side=tk.LEFT, padx=12)
+    tk.Button(w_top, text="保存模板", command=save_word_template).pack(side=tk.LEFT)
+    word_status_label = tk.Label(tab4, text="使用 current_diag；科室固定浦二；入院日期固定 2022.9.20。", fg="gray")
+    word_status_label.pack(fill=tk.X, padx=12)
+    word_template_text = tk.Text(tab4, font=("SimSun", 10), wrap=tk.WORD)
+    word_template_text.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
+    load_word_template()
+    root.bind_all("<F1>", copy_word_consult_text)
     refresh_all_data(); root.mainloop()
 
 if __name__ == "__main__":
