@@ -6,6 +6,7 @@ import ctypes
 import ctypes.wintypes
 import threading
 import time
+import calendar
 from datetime import datetime, timedelta
 
 # [核心防御] 强制系统 DPI 感知
@@ -31,8 +32,23 @@ RPA_CONFIG = {
 }
 
 DB_FILE = "his_data.db"
+APP_VERSION = "6.0"
 is_running_auto = False
+is_paused_auto = False
+stop_requested = False
 locked_tpl_name = ""
+HOTKEY_PAUSE_ID = 1
+HOTKEY_STOP_ID = 2
+VK_F8 = 0x77
+VK_F9 = 0x78
+WM_HOTKEY = 0x0312
+MOD_NOREPEAT = 0x4000
+ATTENDING_RECORD_TITLE = "高一鸣主治医师查房记录"
+SCOPE_ALL = "全部"
+SCOPE_INCLUDE = "指定范围"
+SCOPE_EXCLUDE = "跳过床位"
+INTERVAL_DAYS = {"7天": 7, "14天": 14}
+INTERVAL_MONTHS = {"1个月": 1, "2个月": 2}
 WORD_TEMPLATE_NAME = "中医会诊单"
 WORD_DEPARTMENT = "浦二"
 WORD_FIXED_ADMIT_DATE = "2022.9.20"
@@ -75,6 +91,83 @@ def get_pixel_color(x, y):
     b = (pixel & 0xff0000) >> 16
     return (r, g, b)
 
+def press_key(vk_code):
+    user32.keybd_event(vk_code, 0, 0, 0)
+    user32.keybd_event(vk_code, 0, 2, 0)
+
+def paste_text(text):
+    pyperclip.copy(text)
+    time.sleep(0.2)
+    user32.keybd_event(0x11, 0, 0, 0)
+    press_key(0x56)
+    user32.keybd_event(0x11, 0, 2, 0)
+
+def normalize_bed(value):
+    bed = clean_text(value).strip()
+    return str(int(bed)) if bed.isdigit() else bed
+
+def parse_bed_spec(spec):
+    beds = set()
+    text = spec.replace("，", ",").strip()
+    if not text:
+        raise ValueError("请输入床位范围。")
+    for item in text.split(","):
+        item = item.strip()
+        if not item:
+            raise ValueError("床位范围中存在空项。")
+        if "-" in item:
+            parts = [part.strip() for part in item.split("-")]
+            if len(parts) != 2 or not all(part.isdigit() for part in parts):
+                raise ValueError(f"无法识别床位范围: {item}")
+            start, end = int(parts[0]), int(parts[1])
+            if start < 1 or end < start:
+                raise ValueError(f"床位范围无效: {item}")
+            beds.update(str(bed) for bed in range(start, end + 1))
+        elif item.isdigit() and int(item) >= 1:
+            beds.add(str(int(item)))
+        else:
+            raise ValueError(f"无法识别床位: {item}")
+    return beds
+
+def select_scope_patients(patients, mode, spec):
+    if mode == SCOPE_ALL:
+        return patients
+    selected_beds = parse_bed_spec(spec)
+    if mode == SCOPE_INCLUDE:
+        return [patient for patient in patients if normalize_bed(patient[0]) in selected_beds]
+    if mode == SCOPE_EXCLUDE:
+        return [patient for patient in patients if normalize_bed(patient[0]) not in selected_beds]
+    raise ValueError("未知的患者范围模式。")
+
+def add_calendar_months(start_time, months):
+    month_index = start_time.year * 12 + start_time.month - 1 + months
+    year, zero_based_month = divmod(month_index, 12)
+    month = zero_based_month + 1
+    day = min(start_time.day, calendar.monthrange(year, month)[1])
+    return start_time.replace(year=year, month=month, day=day)
+
+def build_supplement_times(start_time, interval_name, end_time):
+    times = []
+    step = 0
+    while True:
+        if interval_name in INTERVAL_DAYS:
+            current = start_time + timedelta(days=INTERVAL_DAYS[interval_name] * step)
+        elif interval_name in INTERVAL_MONTHS:
+            current = add_calendar_months(start_time, INTERVAL_MONTHS[interval_name] * step)
+        else:
+            raise ValueError("未知的补病史时间间隔。")
+        if current > end_time:
+            break
+        times.append(current)
+        step += 1
+    return times
+
+def build_attending_content(dialogues, doctor_statement, record_index):
+    content = dialogues[record_index % 3].strip()
+    if content and doctor_statement.strip():
+        content += "\n"
+    return content + doctor_statement.strip()
+
 # ==================== 2. 数据库模块 ====================
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -87,7 +180,11 @@ def init_db():
                         name TEXT PRIMARY KEY, content TEXT)''')
     cursor.execute('''CREATE TABLE IF NOT EXISTS word_templates (
                         name TEXT PRIMARY KEY, content TEXT)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS attending_round_templates (
+                        id INTEGER PRIMARY KEY, dialogue1 TEXT, dialogue2 TEXT,
+                        dialogue3 TEXT, doctor_statement TEXT)''')
     cursor.execute("INSERT OR IGNORE INTO word_templates VALUES (?,?)", (WORD_TEMPLATE_NAME, DEFAULT_WORD_TEMPLATE))
+    cursor.execute("INSERT OR IGNORE INTO attending_round_templates VALUES (1,'','','','')")
     conn.commit()
     conn.close()
 
@@ -101,167 +198,269 @@ def refresh_all_data():
     tpl_listbox.delete(0, tk.END)
     mgr_tpl_listbox.delete(0, tk.END)
     cursor.execute("SELECT name FROM templates")
-    for row in cursor.fetchall():
-        tpl_listbox.insert(tk.END, row[0])
-        mgr_tpl_listbox.insert(tk.END, row[0])
+    template_names = [row[0] for row in cursor.fetchall()]
+    for template_name in template_names:
+        tpl_listbox.insert(tk.END, template_name)
+        mgr_tpl_listbox.insert(tk.END, template_name)
+    if 'supp_template_combo' in globals():
+        supp_template_combo['values'] = template_names
     conn.close()
 
-# ==================== 3. 核心全自动逻辑引擎 (V5.8) ====================
-def start_automation_flow(start_row, loop_count, target_time_obj):
-    global is_running_auto, locked_tpl_name
-    is_running_auto = True
-    start_index = start_row - 1 
-    
-    for i in range(loop_count):
-        if not is_running_auto: break 
-        
-        current_processing_row = start_row + i
-        status_update(f"正在扫描第 {current_processing_row} 行 (进度: {i+1}/{loop_count})...")
-        
-        # --- 动作 1: 唤醒列表 ---
-        mouse_click(*RPA_CONFIG["BTN_SWITCH_PATIENT"])
-        time.sleep(0.2) 
-        
-        # --- 动作 2: 精确寻址切换 ---
-        target_y = RPA_CONFIG["PATIENT_FIRST_ROW"][1] + ((start_index + i) * RPA_CONFIG["LINE_HEIGHT"])
-        mouse_double_click(RPA_CONFIG["PATIENT_FIRST_ROW"][0], target_y)
-        
-        # --- 动作 3: 无极闭环轮询 ---
-        status_update(f"第 {current_processing_row} 行: 等待复苏...")
-        busy_check = 0.0
-        while busy_check < 5.0:
-            if not is_running_auto: break
-            if get_pixel_color(*RPA_CONFIG["READY_PIXEL_POS"]) != RPA_CONFIG["READY_PIXEL_RGB"]: break
-            time.sleep(0.2)
-            busy_check += 0.2
-            
-        while is_running_auto:
-            if get_pixel_color(*RPA_CONFIG["READY_PIXEL_POS"]) == RPA_CONFIG["READY_PIXEL_RGB"]:
-                time.sleep(0.8) 
-                break
-            time.sleep(0.3) 
+def load_all_patients():
+    conn = sqlite3.connect(DB_FILE)
+    patients = conn.execute("SELECT * FROM patients").fetchall()
+    conn.close()
+    return sorted(patients, key=patient_sort_key)
 
-        if not is_running_auto: break 
+def load_attending_templates():
+    conn = sqlite3.connect(DB_FILE)
+    row = conn.execute("SELECT dialogue1, dialogue2, dialogue3, doctor_statement FROM attending_round_templates WHERE id=1").fetchone()
+    conn.close()
+    return row or ("", "", "", "")
 
-        # --- 动作 3.5: 破障点击 (安全区) ---
-        mouse_click(*RPA_CONFIG["AREA_SAFE_BLANK"])
+# ==================== 3. 核心全自动逻辑引擎 (V6.0) ====================
+def status_update(msg, color=None):
+    def apply_update():
+        status_label.config(text=msg)
+        if color:
+            status_label.config(fg=color)
+    if threading.current_thread() is threading.main_thread():
+        apply_update()
+    else:
+        root.after(0, apply_update)
+
+def wait_until_resumed():
+    while is_paused_auto and not stop_requested:
+        time.sleep(0.1)
+    return not stop_requested
+
+def find_patient_from_window(patients):
+    hwnd = user32.GetForegroundWindow()
+    length = user32.GetWindowTextLengthW(hwnd)
+    buff = ctypes.create_unicode_buffer(length + 1)
+    user32.GetWindowTextW(hwnd, buff, length + 1)
+    window_title = buff.value
+    matches = [patient for patient in patients if clean_text(patient[1]) and clean_text(patient[1]) in window_title]
+    return matches[0] if len(matches) == 1 else None
+
+def open_patient_row(row_number, total_rows, patients):
+    if not wait_until_resumed():
+        return None
+    status_update(f"正在扫描第 {row_number} 行 (进度: {row_number}/{total_rows})...")
+    mouse_click(*RPA_CONFIG["BTN_SWITCH_PATIENT"])
+    time.sleep(0.2)
+    target_y = RPA_CONFIG["PATIENT_FIRST_ROW"][1] + ((row_number - 1) * RPA_CONFIG["LINE_HEIGHT"])
+    mouse_double_click(RPA_CONFIG["PATIENT_FIRST_ROW"][0], target_y)
+
+    status_update(f"第 {row_number} 行: 等待复苏...")
+    busy_check = 0.0
+    while busy_check < 5.0 and not stop_requested:
+        if get_pixel_color(*RPA_CONFIG["READY_PIXEL_POS"]) != RPA_CONFIG["READY_PIXEL_RGB"]:
+            break
+        time.sleep(0.2)
+        busy_check += 0.2
+    while not stop_requested:
+        if get_pixel_color(*RPA_CONFIG["READY_PIXEL_POS"]) == RPA_CONFIG["READY_PIXEL_RGB"]:
+            time.sleep(0.8)
+            break
+        time.sleep(0.3)
+    if stop_requested:
+        return None
+
+    mouse_click(*RPA_CONFIG["AREA_SAFE_BLANK"])
+    time.sleep(0.5)
+    return find_patient_from_window(patients)
+
+def render_patient_template(template, patient):
+    values = {
+        "name": clean_text(patient[1]),
+        "gender": clean_text(patient[2]),
+        "age": clean_text(patient[3]),
+        "admit_date": clean_text(patient[4]),
+        "complaint": clean_text(patient[5]),
+        "admit_diag": clean_text(patient[6]),
+        "current_diag": clean_text(patient[7]),
+    }
+    for key, value in values.items():
+        template = template.replace("{{" + key + "}}", value)
+    return template
+
+def create_his_record(patient, template, record_time=None, record_title=None):
+    mouse_click(*RPA_CONFIG["AREA_PROGRESS_RECORD"])
+    time.sleep(0.3)
+    mouse_click(*RPA_CONFIG["BTN_NEW_RECORD"])
+    time.sleep(1.2)
+
+    if record_time:
+        time_str = record_time.strftime("%y-%m-%d %H:%M")
+        status_update(f"覆写时间: {time_str}")
+        mouse_click(*RPA_CONFIG["TPL_OPTION"])
         time.sleep(0.5)
+        press_key(0x09)
+        time.sleep(0.1)
+        press_key(0x09)
+        time.sleep(0.3)
+        paste_text(time_str)
+        time.sleep(0.3)
 
-        # --- 动作 4: 标题校验 ---
-        hwnd = user32.GetForegroundWindow()
-        length = user32.GetWindowTextLengthW(hwnd)
-        buff = ctypes.create_unicode_buffer(length + 1)
-        user32.GetWindowTextW(hwnd, buff, length + 1)
-        window_title = buff.value
+        if record_title:
+            press_key(0x09)
+            time.sleep(0.2)
+            paste_text(record_title)
+            time.sleep(0.3)
+            press_key(0x09)
+        else:
+            press_key(0x09)
+            time.sleep(0.1)
+            press_key(0x09)
+        time.sleep(0.3)
+        press_key(0x0D)
+        time.sleep(1.2)
+        mouse_click(*RPA_CONFIG["AREA_PROGRESS_RECORD"])
+        time.sleep(0.3)
+        press_key(0x0D)
+        time.sleep(0.2)
+    else:
+        mouse_double_click(*RPA_CONFIG["TPL_OPTION"])
+        time.sleep(1.2)
 
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM patients")
-        patients = cursor.fetchall()
-        target_p = None
-        for p in patients:
-            if str(p[1]) in window_title:
-                target_p = p
-                break
-        
-        if not target_p:
-            conn.close()
-            status_update(f"【跳过】行 {current_processing_row} 未建档")
+    final_text = render_patient_template(template, patient)
+    paste_text(final_text)
+    time.sleep(0.8)
+    user32.keybd_event(0x11, 0, 0, 0)
+    press_key(0x53)
+    user32.keybd_event(0x11, 0, 2, 0)
+    time.sleep(2.5)
+
+def finish_automation(message):
+    global is_running_auto, is_paused_auto, stop_requested
+    is_running_auto = False
+    is_paused_auto = False
+    stop_requested = False
+    def finish_ui():
+        root.deiconify()
+        status_label.config(text="--- 任务结束 ---", fg="green")
+        messagebox.showinfo("任务完成", message)
+    root.after(0, finish_ui)
+
+def run_automation_worker(target, args):
+    try:
+        target(*args)
+    except Exception as exc:
+        finish_automation(f"执行过程中发生异常，任务已停止。\n{exc}")
+
+def start_automation_flow(patients, target_patients, target_time_obj, template):
+    target_beds = {normalize_bed(patient[0]) for patient in target_patients}
+    processed_beds = set()
+    record_index = 0
+    for row_number in range(1, len(patients) + 1):
+        if stop_requested or processed_beds == target_beds:
+            break
+        patient = open_patient_row(row_number, len(patients), patients)
+        if stop_requested:
+            break
+        if not patient:
+            status_update(f"【跳过】第 {row_number} 行患者未唯一匹配")
+            continue
+        bed = normalize_bed(patient[0])
+        if bed not in target_beds or bed in processed_beds:
+            status_update(f"【跳过】{patient[0]}床 {patient[1]}")
+            continue
+        if not wait_until_resumed():
+            break
+        record_time = target_time_obj + timedelta(minutes=record_index) if target_time_obj else None
+        create_his_record(patient, template, record_time)
+        processed_beds.add(bed)
+        record_index += 1
+        status_update(f"【成功】已归档: {patient[1]}")
+
+    missing = sorted(target_beds - processed_beds, key=lambda bed: int(bed) if bed.isdigit() else 9999)
+    summary = f"已处理 {len(processed_beds)} 位患者。"
+    if missing:
+        summary += "\n未找到或未处理床位: " + ", ".join(missing)
+    if stop_requested:
+        summary += "\n任务已按 F9 安全终止。"
+    finish_automation(summary)
+
+def start_supplement_flow(patients, target_patients, record_times, mode, template, dialogues, doctor_statement):
+    target_beds = {normalize_bed(patient[0]) for patient in target_patients}
+    processed_beds = set()
+    created_count = 0
+    for row_number in range(1, len(patients) + 1):
+        if stop_requested or processed_beds == target_beds:
+            break
+        patient = open_patient_row(row_number, len(patients), patients)
+        if stop_requested:
+            break
+        if not patient:
+            status_update(f"【跳过】第 {row_number} 行患者未唯一匹配")
+            continue
+        bed = normalize_bed(patient[0])
+        if bed not in target_beds or bed in processed_beds:
+            status_update(f"【跳过】{patient[0]}床 {patient[1]}")
             continue
 
-        # --- 动作 5: 【V5.8修改】先预点击夺取焦点，再点击新建 ---
-        mouse_click(*RPA_CONFIG["AREA_PROGRESS_RECORD"])
-        time.sleep(0.3)  # 给 HIS 系统 0.3 秒的焦点渲染时间
-        mouse_click(*RPA_CONFIG["BTN_NEW_RECORD"])
-        time.sleep(1.2) 
-        
-        # ==================== 核心分流控制 ====================
-        if target_time_obj:
-            # 【路径 B: 时间劫持模式】
-            current_loop_time = target_time_obj + timedelta(minutes=i)
-            time_str = current_loop_time.strftime("%y-%m-%d %H:%M")
-            status_update(f"覆写时间: {time_str}")
-            
-            # 单击模板弹出属性框
-            mouse_click(*RPA_CONFIG["TPL_OPTION"])
-            time.sleep(0.5) 
-            
-            # Tab x2 定位时间框
-            user32.keybd_event(0x09, 0, 0, 0); user32.keybd_event(0x09, 0, 2, 0)
-            time.sleep(0.1)
-            user32.keybd_event(0x09, 0, 0, 0); user32.keybd_event(0x09, 0, 2, 0)
-            time.sleep(0.3)
-            
-            # 注入新时间
-            pyperclip.copy(time_str)
-            time.sleep(0.2)
-            user32.keybd_event(0x11, 0, 0, 0); user32.keybd_event(0x56, 0, 0, 0)
-            user32.keybd_event(0x56, 0, 2, 0); user32.keybd_event(0x11, 0, 2, 0)
-            time.sleep(0.3)
-            
-            # Tab x2 跳至确定按钮
-            user32.keybd_event(0x09, 0, 0, 0); user32.keybd_event(0x09, 0, 2, 0)
-            time.sleep(0.1)
-            user32.keybd_event(0x09, 0, 0, 0); user32.keybd_event(0x09, 0, 2, 0)
-            time.sleep(0.3)
-            
-            # Enter 确认生成
-            user32.keybd_event(0x0D, 0, 0, 0); user32.keybd_event(0x0D, 0, 2, 0)
-            time.sleep(1.2)
-            
-            # 【托底防御】强行点击正文区，防止焦点遗落在时间框
-            mouse_click(*RPA_CONFIG["AREA_PROGRESS_RECORD"])
-            time.sleep(0.3)
+        patient_completed = True
+        for record_index, record_time in enumerate(record_times):
+            if not wait_until_resumed():
+                patient_completed = False
+                break
+            if mode == "主治医师查房":
+                content = build_attending_content(dialogues, doctor_statement, record_index)
+                record_title = ATTENDING_RECORD_TITLE
+            else:
+                content = template
+                record_title = None
+            status_update(f"{patient[0]}床 {patient[1]}: 第 {record_index + 1}/{len(record_times)} 条")
+            create_his_record(patient, content, record_time, record_title)
+            created_count += 1
+            if stop_requested:
+                patient_completed = False
+                break
+        if patient_completed:
+            processed_beds.add(bed)
+        if stop_requested:
+            break
 
-            # 二次确认编辑区焦点，防止历史时间模式下正文注入前光标未落位
-            user32.keybd_event(0x0D, 0, 0, 0); user32.keybd_event(0x0D, 0, 2, 0)
-            time.sleep(0.2)
-            
-        else:
-            # 【路径 A: 默认常规模式】
-            mouse_double_click(*RPA_CONFIG["TPL_OPTION"])
-            time.sleep(1.2) 
-        # ========================================================
-
-        # --- 动作 7: 数据提取与注入正文 ---
-        cursor.execute("SELECT content FROM templates WHERE name=?", (locked_tpl_name,))
-        tpl_data = cursor.fetchone()
-        conn.close()
-        
-        if not tpl_data: continue
-        final_text = tpl_data[0].replace("{{name}}", str(target_p[1])).replace("{{gender}}", str(target_p[2])).replace("{{age}}", str(target_p[3])).replace("{{admit_date}}", str(target_p[4])).replace("{{complaint}}", str(target_p[5])).replace("{{admit_diag}}", str(target_p[6])).replace("{{current_diag}}", str(target_p[7]))
-        
-        pyperclip.copy(final_text)
-        time.sleep(0.4)
-        user32.keybd_event(0x11, 0, 0, 0) # Ctrl
-        user32.keybd_event(0x56, 0, 0, 0) # V
-        user32.keybd_event(0x56, 0, 2, 0)
-        user32.keybd_event(0x11, 0, 2, 0)
-        time.sleep(0.8) 
-        
-        # --- 动作 8: 归档提交 (Ctrl + S) ---
-        user32.keybd_event(0x11, 0, 0, 0) # Ctrl
-        user32.keybd_event(0x53, 0, 0, 0) # S
-        user32.keybd_event(0x53, 0, 2, 0) 
-        user32.keybd_event(0x11, 0, 2, 0) 
-        
-        status_update(f"【成功】已归档: {target_p[1]}")
-        time.sleep(2.5) 
-
-    is_running_auto = False
-    status_update("--- 任务结束 ---")
-    root.deiconify() 
-    messagebox.showinfo("任务完成", "流水线已处理完毕。")
+    missing = sorted(target_beds - processed_beds, key=lambda bed: int(bed) if bed.isdigit() else 9999)
+    summary = f"已创建 {created_count} 条补充病史，完整处理 {len(processed_beds)} 位患者。"
+    if missing:
+        summary += "\n未找到或未完整处理床位: " + ", ".join(missing)
+    if stop_requested:
+        summary += "\n任务已按 F9 安全终止。"
+    finish_automation(summary)
 
 # ==================== 4. UI 交互层 ====================
-def status_update(msg):
-    status_label.config(text=msg)
+def toggle_pause_auto():
+    global is_paused_auto
+    if not is_running_auto:
+        return
+    is_paused_auto = not is_paused_auto
+    status_update("【已暂停】再次按 F8 继续" if is_paused_auto else "【继续运行】", "orange" if is_paused_auto else "green")
 
 def stop_auto():
-    global is_running_auto
-    is_running_auto = False
-    status_update("【紧急干预】正在强行终止...")
-    root.deiconify()
+    global stop_requested, is_paused_auto
+    if not is_running_auto:
+        root.deiconify()
+        return
+    stop_requested = True
+    is_paused_auto = False
+    status_update("【安全终止】当前原子动作完成后停止...", "red")
+
+def global_hotkey_loop():
+    pause_ok = user32.RegisterHotKey(None, HOTKEY_PAUSE_ID, MOD_NOREPEAT, VK_F8)
+    stop_ok = user32.RegisterHotKey(None, HOTKEY_STOP_ID, MOD_NOREPEAT, VK_F9)
+    if not pause_ok or not stop_ok:
+        root.after(0, lambda: status_update("警告：F8/F9 全局快捷键注册失败。", "red"))
+    msg = ctypes.wintypes.MSG()
+    while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+        if msg.message == WM_HOTKEY and msg.wParam == HOTKEY_PAUSE_ID:
+            root.after(0, toggle_pause_auto)
+        elif msg.message == WM_HOTKEY and msg.wParam == HOTKEY_STOP_ID:
+            root.after(0, stop_auto)
+
+def start_global_hotkeys():
+    threading.Thread(target=global_hotkey_loop, daemon=True).start()
 
 def toggle_time_entry():
     if time_var.get():
@@ -269,17 +468,31 @@ def toggle_time_entry():
     else:
         time_entry.config(state=tk.DISABLED)
 
+def toggle_scope_entry():
+    state = tk.DISABLED if scope_var.get() == SCOPE_ALL else tk.NORMAL
+    for entry in scope_entries:
+        entry.config(state=state)
+
 def run_thread():
+    global is_running_auto, is_paused_auto, stop_requested
     try:
-        start_row = int(start_entry.get())
-        count = int(loop_entry.get())
-        if start_row < 1 or count < 1:
-            messagebox.showerror("参数异常", "请输入 ≥1 的正整数。")
+        if is_running_auto:
+            messagebox.showwarning("任务运行中", "请先完成或终止当前任务。")
             return
         if not locked_tpl_name:
             messagebox.showwarning("拦截", "请先锁定模板！")
             return
-        
+        patients = load_all_patients()
+        target_patients = select_scope_patients(patients, scope_var.get(), scope_text_var.get())
+        if not patients or not target_patients:
+            messagebox.showwarning("无患者", "本地患者库或所选患者范围为空。")
+            return
+        conn = sqlite3.connect(DB_FILE)
+        row = conn.execute("SELECT content FROM templates WHERE name=?", (locked_tpl_name,)).fetchone()
+        conn.close()
+        if not row:
+            messagebox.showwarning("模板缺失", "锁定的模板不存在。")
+            return
         target_time_obj = None
         if time_var.get():
             time_str = time_entry.get().strip()
@@ -288,14 +501,20 @@ def run_thread():
             except ValueError:
                 messagebox.showerror("格式阻断", "时间格式存在瑕疵！\n请严格遵循: YY-MM-DD HH:MM\n(示例: 26-04-26 10:00)")
                 return
-
+        is_running_auto = True
+        is_paused_auto = False
+        stop_requested = False
         status_update("程序将自动隐藏，3 秒后接管 HIS...")
         root.update()
         time.sleep(3)
-        root.iconify() 
-        threading.Thread(target=start_automation_flow, args=(start_row, count, target_time_obj), daemon=True).start()
+        root.iconify()
+        threading.Thread(
+            target=run_automation_worker,
+            args=(start_automation_flow, (patients, target_patients, target_time_obj, row[0])),
+            daemon=True
+        ).start()
     except ValueError:
-        messagebox.showerror("参数错误", "请输入有效的数字。")
+        messagebox.showerror("参数错误", "患者范围格式无效，请使用例如 1-8,13-17。")
 
 def on_tpl_select(event):
     global locked_tpl_name
@@ -358,6 +577,86 @@ def on_template_select(event):
     conn = sqlite3.connect(DB_FILE); content = conn.execute("SELECT content FROM templates WHERE name=?", (mgr_tpl_listbox.get(selected),)).fetchone()[0]; conn.close()
     tpl_name_entry.delete(0, tk.END); tpl_name_entry.insert(0, mgr_tpl_listbox.get(selected))
     tpl_content_text.delete("1.0", tk.END); tpl_content_text.insert(tk.END, content)
+
+def save_attending_templates(show_message=True):
+    values = [widget.get("1.0", tk.END).strip() for widget in attending_text_widgets]
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("REPLACE INTO attending_round_templates VALUES (1,?,?,?,?)", values)
+    conn.commit()
+    conn.close()
+    if show_message:
+        messagebox.showinfo("已保存", "主治医师查房循环模板已保存。")
+    return values
+
+def load_attending_templates_into_ui():
+    values = load_attending_templates()
+    for widget, value in zip(attending_text_widgets, values):
+        widget.delete("1.0", tk.END)
+        widget.insert(tk.END, value)
+
+def run_supplement_thread():
+    global is_running_auto, is_paused_auto, stop_requested
+    if is_running_auto:
+        messagebox.showwarning("任务运行中", "请先完成或终止当前任务。")
+        return
+    try:
+        patients = load_all_patients()
+        target_patients = select_scope_patients(patients, scope_var.get(), scope_text_var.get())
+        start_date = datetime.strptime(supp_start_date_entry.get().strip(), "%Y-%m-%d").date()
+        start_clock = datetime.strptime(supp_time_entry.get().strip(), "%H:%M").time()
+        start_time = datetime.combine(start_date, start_clock)
+        record_times = build_supplement_times(start_time, supp_interval_var.get(), datetime.now())
+    except ValueError as exc:
+        messagebox.showerror("参数错误", str(exc))
+        return
+    if not patients or not target_patients:
+        messagebox.showwarning("无患者", "本地患者库或所选患者范围为空。")
+        return
+    if not record_times:
+        messagebox.showwarning("时间范围无效", "起始时间晚于当前系统时间，没有可创建的病史。")
+        return
+
+    mode = supp_mode_var.get()
+    template = ""
+    dialogues = ("", "", "")
+    doctor_statement = ""
+    if mode == "主治医师查房":
+        values = save_attending_templates(show_message=False)
+        dialogues = tuple(values[:3])
+        doctor_statement = values[3]
+        if not all(dialogues) or not doctor_statement:
+            messagebox.showwarning("模板不完整", "请填写3种对话和固定医生发言。")
+            return
+    else:
+        template_name = supp_template_var.get().strip()
+        conn = sqlite3.connect(DB_FILE)
+        row = conn.execute("SELECT content FROM templates WHERE name=?", (template_name,)).fetchone()
+        conn.close()
+        if not row:
+            messagebox.showwarning("模板缺失", "请选择一个普通病史模板。")
+            return
+        template = row[0]
+
+    total_records = len(target_patients) * len(record_times)
+    if not messagebox.askyesno(
+        "确认补病史",
+        f"患者 {len(target_patients)} 位，每位 {len(record_times)} 条，共 {total_records} 条。\n"
+        f"起始 {start_time:%Y-%m-%d %H:%M}，间隔 {supp_interval_var.get()}。\n\n确认开始吗？"
+    ):
+        return
+
+    is_running_auto = True
+    is_paused_auto = False
+    stop_requested = False
+    status_update("程序将自动隐藏，3 秒后接管 HIS...")
+    root.update()
+    time.sleep(3)
+    root.iconify()
+    threading.Thread(
+        target=run_automation_worker,
+        args=(start_supplement_flow, (patients, target_patients, record_times, mode, template, dialogues, doctor_statement)),
+        daemon=True
+    ).start()
 
 def save_word_template():
     content = word_template_text.get("1.0", tk.END).strip()
@@ -439,11 +738,12 @@ def copy_word_consult_text(event=None):
     word_status_label.config(text=f"已复制 {len(pages)} 页会诊单。请切换到 Word 97-2003 后粘贴。", fg="green")
 
 def setup_ui():
-    global tpl_listbox, status_label, loop_entry, start_entry, lock_var, root, mgr_tree, mgr_tpl_listbox, p_bed, p_name, p_gender, p_age, p_admit, p_comp, p_adiag, p_cdiag, tpl_name_entry, tpl_content_text
+    global tpl_listbox, status_label, lock_var, root, mgr_tree, mgr_tpl_listbox, p_bed, p_name, p_gender, p_age, p_admit, p_comp, p_adiag, p_cdiag, tpl_name_entry, tpl_content_text
     global word_start_entry, word_count_entry, word_template_text, word_status_label
-    global time_var, time_entry
+    global time_var, time_entry, scope_var, scope_text_var, scope_entries
+    global supp_mode_var, supp_template_var, supp_template_combo, supp_start_date_entry, supp_time_entry, supp_interval_var, attending_text_widgets
     
-    root = tk.Tk(); root.title("极速精神科工作站 V5.8"); root.geometry("850x600")
+    root = tk.Tk(); root.title(f"极速精神科工作站 V{APP_VERSION}"); root.geometry("900x650")
     nb = ttk.Notebook(root); nb.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
     tab1 = ttk.Frame(nb); nb.add(tab1, text="🚀 极速引擎")
     cf = tk.Frame(tab1); cf.pack(fill=tk.BOTH, expand=True, padx=40, pady=20)
@@ -459,13 +759,17 @@ def setup_ui():
     time_entry.pack(side=tk.LEFT, padx=5)
     time_entry.config(state=tk.DISABLED) 
     
-    lf = tk.Frame(cf); lf.pack(pady=5)
-    tk.Label(lf, text="起始向下扫描行:").pack(side=tk.LEFT)
-    start_entry = tk.Entry(lf, width=8, justify='center'); start_entry.insert(0, "1"); start_entry.pack(side=tk.LEFT, padx=5)
-    tk.Label(lf, text="连续扫描总行数:").pack(side=tk.LEFT, padx=(15, 0))
-    loop_entry = tk.Entry(lf, width=8, justify='center'); loop_entry.insert(0, "4"); loop_entry.pack(side=tk.LEFT, padx=5)
-    bf = tk.Frame(cf); bf.pack(pady=10); tk.Button(bf, text="▶ 启动执行流", bg="#dff0d8", command=run_thread, width=25, height=2).pack(side=tk.LEFT, padx=10); tk.Button(bf, text="🛑 急停", bg="#f2dede", command=stop_auto, width=15, height=2).pack(side=tk.LEFT, padx=10)
-    status_label = tk.Label(cf, text="就绪。", fg="green", font=("Arial", 10)); status_label.pack(pady=5)
+    scope_var = tk.StringVar(value=SCOPE_ALL)
+    scope_text_var = tk.StringVar()
+    scope_entries = []
+    scope_fm = tk.LabelFrame(cf, text="患者范围"); scope_fm.pack(fill=tk.X, pady=8)
+    for mode in (SCOPE_ALL, SCOPE_INCLUDE, SCOPE_EXCLUDE):
+        tk.Radiobutton(scope_fm, text=mode, value=mode, variable=scope_var, command=toggle_scope_entry).pack(side=tk.LEFT, padx=8)
+    scope_entry = tk.Entry(scope_fm, width=24, textvariable=scope_text_var, state=tk.DISABLED)
+    scope_entry.pack(side=tk.LEFT, padx=8); scope_entries.append(scope_entry)
+    tk.Label(scope_fm, text="例如 1-8,13-17", fg="gray").pack(side=tk.LEFT)
+    bf = tk.Frame(cf); bf.pack(pady=10); tk.Button(bf, text="▶ 启动执行流", bg="#dff0d8", command=run_thread, width=25, height=2).pack(side=tk.LEFT, padx=10); tk.Button(bf, text="■ 安全终止 (F9)", bg="#f2dede", command=stop_auto, width=18, height=2).pack(side=tk.LEFT, padx=10)
+    status_label = tk.Label(cf, text="就绪。F8 暂停/继续，F9 安全终止。", fg="green", font=("Arial", 10)); status_label.pack(pady=5)
     
     tab2 = ttk.Frame(nb); nb.add(tab2, text="⚙️ 患者管理"); p_left = tk.Frame(tab2); p_left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
     cols = ("bed", "name", "gender", "age", "admit_date", "complaint"); mgr_tree = ttk.Treeview(p_left, columns=cols, show="headings"); [mgr_tree.heading(c, text=t) or mgr_tree.column(c, width=60) for c, t in zip(cols, ["床号", "姓名", "性别", "年龄", "入院日", "主诉"])]; mgr_tree.pack(fill=tk.BOTH, expand=True); mgr_tree.bind('<<TreeviewSelect>>', on_patient_select)
@@ -487,8 +791,45 @@ def setup_ui():
     word_template_text = tk.Text(tab4, font=("SimSun", 10), wrap=tk.WORD)
     word_template_text.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
     load_word_template()
+
+    tab5 = ttk.Frame(nb); nb.add(tab5, text="⏱ 补病史")
+    supp_top = tk.Frame(tab5); supp_top.pack(fill=tk.X, padx=10, pady=6)
+    supp_mode_var = tk.StringVar(value="主治医师查房")
+    tk.Label(supp_top, text="模式:").pack(side=tk.LEFT)
+    tk.Radiobutton(supp_top, text="主治医师查房", value="主治医师查房", variable=supp_mode_var).pack(side=tk.LEFT)
+    tk.Radiobutton(supp_top, text="普通模板", value="普通模板", variable=supp_mode_var).pack(side=tk.LEFT)
+    supp_template_var = tk.StringVar()
+    supp_template_combo = ttk.Combobox(supp_top, width=18, textvariable=supp_template_var, state="readonly")
+    supp_template_combo.pack(side=tk.LEFT, padx=6)
+    tk.Label(supp_top, text="起始日期:").pack(side=tk.LEFT, padx=(8, 0))
+    supp_start_date_entry = tk.Entry(supp_top, width=11, justify="center"); supp_start_date_entry.insert(0, datetime.now().strftime("%Y-%m-%d")); supp_start_date_entry.pack(side=tk.LEFT, padx=3)
+    supp_time_entry = tk.Entry(supp_top, width=6, justify="center"); supp_time_entry.insert(0, "09:00"); supp_time_entry.pack(side=tk.LEFT, padx=3)
+    supp_interval_var = tk.StringVar(value="7天")
+    ttk.Combobox(supp_top, width=7, textvariable=supp_interval_var, values=("7天", "14天", "1个月", "2个月"), state="readonly").pack(side=tk.LEFT, padx=6)
+
+    supp_scope = tk.LabelFrame(tab5, text="患者范围"); supp_scope.pack(fill=tk.X, padx=10, pady=4)
+    for mode in (SCOPE_ALL, SCOPE_INCLUDE, SCOPE_EXCLUDE):
+        tk.Radiobutton(supp_scope, text=mode, value=mode, variable=scope_var, command=toggle_scope_entry).pack(side=tk.LEFT, padx=8)
+    supp_scope_entry = tk.Entry(supp_scope, width=24, textvariable=scope_text_var, state=tk.DISABLED)
+    supp_scope_entry.pack(side=tk.LEFT, padx=8); scope_entries.append(supp_scope_entry)
+    tk.Label(supp_scope, text="例如 1-8,13-17", fg="gray").pack(side=tk.LEFT)
+
+    attending_nb = ttk.Notebook(tab5); attending_nb.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+    attending_text_widgets = []
+    for tab_name in ("对话模式1", "对话模式2", "对话模式3", "固定医生发言"):
+        editor_tab = ttk.Frame(attending_nb); attending_nb.add(editor_tab, text=tab_name)
+        editor = tk.Text(editor_tab, font=("SimSun", 10), wrap=tk.WORD)
+        editor.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        attending_text_widgets.append(editor)
+    load_attending_templates_into_ui()
+    supp_buttons = tk.Frame(tab5); supp_buttons.pack(fill=tk.X, padx=10, pady=6)
+    tk.Button(supp_buttons, text="保存主治查房模板", command=save_attending_templates).pack(side=tk.LEFT)
+    tk.Button(supp_buttons, text="▶ 开始补病史", bg="#dff0d8", command=run_supplement_thread, width=22, height=2).pack(side=tk.RIGHT)
+
     root.bind_all("<F1>", copy_word_consult_text)
-    refresh_all_data(); root.mainloop()
+    refresh_all_data()
+    start_global_hotkeys()
+    root.mainloop()
 
 if __name__ == "__main__":
     init_db(); setup_ui()
