@@ -32,7 +32,7 @@ RPA_CONFIG = {
 }
 
 DB_FILE = "his_data.db"
-APP_VERSION = "6.0"
+APP_VERSION = "6.1"
 is_running_auto = False
 is_paused_auto = False
 stop_requested = False
@@ -43,7 +43,7 @@ VK_F8 = 0x77
 VK_F9 = 0x78
 WM_HOTKEY = 0x0312
 MOD_NOREPEAT = 0x4000
-ATTENDING_RECORD_TITLE = "高一鸣主治医师查房记录"
+DEFAULT_SUPPLEMENT_TITLE = "高一鸣主治医师查房记录"
 SCOPE_ALL = "全部"
 SCOPE_INCLUDE = "指定范围"
 SCOPE_EXCLUDE = "跳过床位"
@@ -162,12 +162,6 @@ def build_supplement_times(start_time, interval_name, end_time):
         step += 1
     return times
 
-def build_attending_content(dialogues, doctor_statement, record_index):
-    content = dialogues[record_index % 3].strip()
-    if content and doctor_statement.strip():
-        content += "\n"
-    return content + doctor_statement.strip()
-
 # ==================== 2. 数据库模块 ====================
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -180,11 +174,7 @@ def init_db():
                         name TEXT PRIMARY KEY, content TEXT)''')
     cursor.execute('''CREATE TABLE IF NOT EXISTS word_templates (
                         name TEXT PRIMARY KEY, content TEXT)''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS attending_round_templates (
-                        id INTEGER PRIMARY KEY, dialogue1 TEXT, dialogue2 TEXT,
-                        dialogue3 TEXT, doctor_statement TEXT)''')
     cursor.execute("INSERT OR IGNORE INTO word_templates VALUES (?,?)", (WORD_TEMPLATE_NAME, DEFAULT_WORD_TEMPLATE))
-    cursor.execute("INSERT OR IGNORE INTO attending_round_templates VALUES (1,'','','','')")
     conn.commit()
     conn.close()
 
@@ -202,8 +192,9 @@ def refresh_all_data():
     for template_name in template_names:
         tpl_listbox.insert(tk.END, template_name)
         mgr_tpl_listbox.insert(tk.END, template_name)
-    if 'supp_template_combo' in globals():
-        supp_template_combo['values'] = template_names
+    if 'supp_template_combos' in globals():
+        for combo in supp_template_combos:
+            combo['values'] = [""] + template_names
     conn.close()
 
 def load_all_patients():
@@ -212,13 +203,7 @@ def load_all_patients():
     conn.close()
     return sorted(patients, key=patient_sort_key)
 
-def load_attending_templates():
-    conn = sqlite3.connect(DB_FILE)
-    row = conn.execute("SELECT dialogue1, dialogue2, dialogue3, doctor_statement FROM attending_round_templates WHERE id=1").fetchone()
-    conn.close()
-    return row or ("", "", "", "")
-
-# ==================== 3. 核心全自动逻辑引擎 (V6.0) ====================
+# ==================== 3. 核心全自动逻辑引擎 (V6.1) ====================
 def status_update(msg, color=None):
     def apply_update():
         status_label.config(text=msg)
@@ -382,50 +367,25 @@ def start_automation_flow(patients, target_patients, target_time_obj, template):
         summary += "\n任务已按 F9 安全终止。"
     finish_automation(summary)
 
-def start_supplement_flow(patients, target_patients, record_times, mode, template, dialogues, doctor_statement):
-    target_beds = {normalize_bed(patient[0]) for patient in target_patients}
-    processed_beds = set()
+def start_supplement_flow(patients, record_times, templates, record_title):
+    time.sleep(0.5)
+    patient = find_patient_from_window(patients)
+    if not patient:
+        finish_automation("当前 HIS 窗口患者未能与本地患者库唯一匹配，未执行任何写入。")
+        return
+
     created_count = 0
-    for row_number in range(1, len(patients) + 1):
-        if stop_requested or processed_beds == target_beds:
+    for record_index, record_time in enumerate(record_times):
+        if not wait_until_resumed():
             break
-        patient = open_patient_row(row_number, len(patients), patients)
-        if stop_requested:
-            break
-        if not patient:
-            status_update(f"【跳过】第 {row_number} 行患者未唯一匹配")
-            continue
-        bed = normalize_bed(patient[0])
-        if bed not in target_beds or bed in processed_beds:
-            status_update(f"【跳过】{patient[0]}床 {patient[1]}")
-            continue
-
-        patient_completed = True
-        for record_index, record_time in enumerate(record_times):
-            if not wait_until_resumed():
-                patient_completed = False
-                break
-            if mode == "主治医师查房":
-                content = build_attending_content(dialogues, doctor_statement, record_index)
-                record_title = ATTENDING_RECORD_TITLE
-            else:
-                content = template
-                record_title = None
-            status_update(f"{patient[0]}床 {patient[1]}: 第 {record_index + 1}/{len(record_times)} 条")
-            create_his_record(patient, content, record_time, record_title)
-            created_count += 1
-            if stop_requested:
-                patient_completed = False
-                break
-        if patient_completed:
-            processed_beds.add(bed)
+        content = templates[record_index % len(templates)]
+        status_update(f"{patient[0]}床 {patient[1]}: 第 {record_index + 1}/{len(record_times)} 条")
+        create_his_record(patient, content, record_time, record_title)
+        created_count += 1
         if stop_requested:
             break
 
-    missing = sorted(target_beds - processed_beds, key=lambda bed: int(bed) if bed.isdigit() else 9999)
-    summary = f"已创建 {created_count} 条补充病史，完整处理 {len(processed_beds)} 位患者。"
-    if missing:
-        summary += "\n未找到或未完整处理床位: " + ", ".join(missing)
+    summary = f"{patient[0]}床 {patient[1]}：已创建 {created_count} 条补充病史。"
     if stop_requested:
         summary += "\n任务已按 F9 安全终止。"
     finish_automation(summary)
@@ -578,21 +538,8 @@ def on_template_select(event):
     tpl_name_entry.delete(0, tk.END); tpl_name_entry.insert(0, mgr_tpl_listbox.get(selected))
     tpl_content_text.delete("1.0", tk.END); tpl_content_text.insert(tk.END, content)
 
-def save_attending_templates(show_message=True):
-    values = [widget.get("1.0", tk.END).strip() for widget in attending_text_widgets]
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute("REPLACE INTO attending_round_templates VALUES (1,?,?,?,?)", values)
-    conn.commit()
-    conn.close()
-    if show_message:
-        messagebox.showinfo("已保存", "主治医师查房循环模板已保存。")
-    return values
-
-def load_attending_templates_into_ui():
-    values = load_attending_templates()
-    for widget, value in zip(attending_text_widgets, values):
-        widget.delete("1.0", tk.END)
-        widget.insert(tk.END, value)
+def toggle_supplement_title():
+    supp_title_entry.config(state=tk.DISABLED if supp_blank_title_var.get() else tk.NORMAL)
 
 def run_supplement_thread():
     global is_running_auto, is_paused_auto, stop_requested
@@ -601,7 +548,6 @@ def run_supplement_thread():
         return
     try:
         patients = load_all_patients()
-        target_patients = select_scope_patients(patients, scope_var.get(), scope_text_var.get())
         start_date = datetime.strptime(supp_start_date_entry.get().strip(), "%Y-%m-%d").date()
         start_clock = datetime.strptime(supp_time_entry.get().strip(), "%H:%M").time()
         start_time = datetime.combine(start_date, start_clock)
@@ -609,38 +555,43 @@ def run_supplement_thread():
     except ValueError as exc:
         messagebox.showerror("参数错误", str(exc))
         return
-    if not patients or not target_patients:
-        messagebox.showwarning("无患者", "本地患者库或所选患者范围为空。")
+    if not patients:
+        messagebox.showwarning("无患者", "本地患者库为空。")
         return
     if not record_times:
         messagebox.showwarning("时间范围无效", "起始时间晚于当前系统时间，没有可创建的病史。")
         return
 
-    mode = supp_mode_var.get()
-    template = ""
-    dialogues = ("", "", "")
-    doctor_statement = ""
-    if mode == "主治医师查房":
-        values = save_attending_templates(show_message=False)
-        dialogues = tuple(values[:3])
-        doctor_statement = values[3]
-        if not all(dialogues) or not doctor_statement:
-            messagebox.showwarning("模板不完整", "请填写3种对话和固定医生发言。")
-            return
-    else:
-        template_name = supp_template_var.get().strip()
-        conn = sqlite3.connect(DB_FILE)
+    template_names = [var.get().strip() for var in supp_template_vars]
+    if not template_names[0]:
+        messagebox.showwarning("模板缺失", "模板1必须选择。")
+        return
+    if bool(template_names[1]) != bool(template_names[2]):
+        messagebox.showwarning("模板组合不完整", "请只选择模板1，或同时选择模板1、2、3。")
+        return
+    selected_names = template_names if template_names[1] else template_names[:1]
+    if len(selected_names) == 3 and len(set(selected_names)) != 3:
+        messagebox.showwarning("模板重复", "循环使用的3个模板必须互不相同。")
+        return
+    conn = sqlite3.connect(DB_FILE)
+    templates = []
+    for template_name in selected_names:
         row = conn.execute("SELECT content FROM templates WHERE name=?", (template_name,)).fetchone()
-        conn.close()
-        if not row:
-            messagebox.showwarning("模板缺失", "请选择一个普通病史模板。")
-            return
-        template = row[0]
+        if row:
+            templates.append(row[0])
+    conn.close()
+    if len(templates) != len(selected_names):
+        messagebox.showwarning("模板缺失", "所选模板已被删除，请重新选择。")
+        return
 
-    total_records = len(target_patients) * len(record_times)
+    record_title = "" if supp_blank_title_var.get() else supp_title_entry.get().strip()
+    if not supp_blank_title_var.get() and not record_title:
+        messagebox.showwarning("病史名称为空", "请输入病史名称，或勾选“病史名称留空”。")
+        return
+
     if not messagebox.askyesno(
         "确认补病史",
-        f"患者 {len(target_patients)} 位，每位 {len(record_times)} 条，共 {total_records} 条。\n"
+        f"将为当前 HIS 患者创建 {len(record_times)} 条病史，使用 {len(templates)} 个模板。\n"
         f"起始 {start_time:%Y-%m-%d %H:%M}，间隔 {supp_interval_var.get()}。\n\n确认开始吗？"
     ):
         return
@@ -654,7 +605,7 @@ def run_supplement_thread():
     root.iconify()
     threading.Thread(
         target=run_automation_worker,
-        args=(start_supplement_flow, (patients, target_patients, record_times, mode, template, dialogues, doctor_statement)),
+        args=(start_supplement_flow, (patients, record_times, templates, record_title)),
         daemon=True
     ).start()
 
@@ -741,7 +692,8 @@ def setup_ui():
     global tpl_listbox, status_label, lock_var, root, mgr_tree, mgr_tpl_listbox, p_bed, p_name, p_gender, p_age, p_admit, p_comp, p_adiag, p_cdiag, tpl_name_entry, tpl_content_text
     global word_start_entry, word_count_entry, word_template_text, word_status_label
     global time_var, time_entry, scope_var, scope_text_var, scope_entries
-    global supp_mode_var, supp_template_var, supp_template_combo, supp_start_date_entry, supp_time_entry, supp_interval_var, attending_text_widgets
+    global supp_template_vars, supp_template_combos, supp_start_date_entry, supp_time_entry, supp_interval_var
+    global supp_title_entry, supp_blank_title_var
     
     root = tk.Tk(); root.title(f"极速精神科工作站 V{APP_VERSION}"); root.geometry("900x650")
     nb = ttk.Notebook(root); nb.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -794,36 +746,29 @@ def setup_ui():
 
     tab5 = ttk.Frame(nb); nb.add(tab5, text="⏱ 补病史")
     supp_top = tk.Frame(tab5); supp_top.pack(fill=tk.X, padx=10, pady=6)
-    supp_mode_var = tk.StringVar(value="主治医师查房")
-    tk.Label(supp_top, text="模式:").pack(side=tk.LEFT)
-    tk.Radiobutton(supp_top, text="主治医师查房", value="主治医师查房", variable=supp_mode_var).pack(side=tk.LEFT)
-    tk.Radiobutton(supp_top, text="普通模板", value="普通模板", variable=supp_mode_var).pack(side=tk.LEFT)
-    supp_template_var = tk.StringVar()
-    supp_template_combo = ttk.Combobox(supp_top, width=18, textvariable=supp_template_var, state="readonly")
-    supp_template_combo.pack(side=tk.LEFT, padx=6)
     tk.Label(supp_top, text="起始日期:").pack(side=tk.LEFT, padx=(8, 0))
     supp_start_date_entry = tk.Entry(supp_top, width=11, justify="center"); supp_start_date_entry.insert(0, datetime.now().strftime("%Y-%m-%d")); supp_start_date_entry.pack(side=tk.LEFT, padx=3)
     supp_time_entry = tk.Entry(supp_top, width=6, justify="center"); supp_time_entry.insert(0, "09:00"); supp_time_entry.pack(side=tk.LEFT, padx=3)
     supp_interval_var = tk.StringVar(value="7天")
     ttk.Combobox(supp_top, width=7, textvariable=supp_interval_var, values=("7天", "14天", "1个月", "2个月"), state="readonly").pack(side=tk.LEFT, padx=6)
 
-    supp_scope = tk.LabelFrame(tab5, text="患者范围"); supp_scope.pack(fill=tk.X, padx=10, pady=4)
-    for mode in (SCOPE_ALL, SCOPE_INCLUDE, SCOPE_EXCLUDE):
-        tk.Radiobutton(supp_scope, text=mode, value=mode, variable=scope_var, command=toggle_scope_entry).pack(side=tk.LEFT, padx=8)
-    supp_scope_entry = tk.Entry(supp_scope, width=24, textvariable=scope_text_var, state=tk.DISABLED)
-    supp_scope_entry.pack(side=tk.LEFT, padx=8); scope_entries.append(supp_scope_entry)
-    tk.Label(supp_scope, text="例如 1-8,13-17", fg="gray").pack(side=tk.LEFT)
+    template_frame = tk.LabelFrame(tab5, text="病史模板"); template_frame.pack(fill=tk.X, padx=10, pady=8)
+    supp_template_vars = [tk.StringVar() for _ in range(3)]
+    supp_template_combos = []
+    for index, variable in enumerate(supp_template_vars):
+        tk.Label(template_frame, text=f"模板{index + 1}:").grid(row=index, column=0, sticky=tk.E, padx=6, pady=5)
+        combo = ttk.Combobox(template_frame, width=34, textvariable=variable, state="readonly")
+        combo.grid(row=index, column=1, sticky=tk.W, padx=6, pady=5)
+        supp_template_combos.append(combo)
 
-    attending_nb = ttk.Notebook(tab5); attending_nb.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-    attending_text_widgets = []
-    for tab_name in ("对话模式1", "对话模式2", "对话模式3", "固定医生发言"):
-        editor_tab = ttk.Frame(attending_nb); attending_nb.add(editor_tab, text=tab_name)
-        editor = tk.Text(editor_tab, font=("SimSun", 10), wrap=tk.WORD)
-        editor.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        attending_text_widgets.append(editor)
-    load_attending_templates_into_ui()
+    title_frame = tk.LabelFrame(tab5, text="病史名称"); title_frame.pack(fill=tk.X, padx=10, pady=8)
+    supp_title_entry = tk.Entry(title_frame, width=42)
+    supp_title_entry.insert(0, DEFAULT_SUPPLEMENT_TITLE)
+    supp_title_entry.pack(side=tk.LEFT, padx=8, pady=8)
+    supp_blank_title_var = tk.BooleanVar(value=False)
+    tk.Checkbutton(title_frame, text="病史名称留空", variable=supp_blank_title_var, command=toggle_supplement_title).pack(side=tk.LEFT, padx=8)
+
     supp_buttons = tk.Frame(tab5); supp_buttons.pack(fill=tk.X, padx=10, pady=6)
-    tk.Button(supp_buttons, text="保存主治查房模板", command=save_attending_templates).pack(side=tk.LEFT)
     tk.Button(supp_buttons, text="▶ 开始补病史", bg="#dff0d8", command=run_supplement_thread, width=22, height=2).pack(side=tk.RIGHT)
 
     root.bind_all("<F1>", copy_word_consult_text)

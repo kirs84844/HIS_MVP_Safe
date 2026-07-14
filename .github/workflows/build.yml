@@ -27,10 +27,10 @@ jobs:
 
     - name: Build EXE (无控制台黑框 32位版)
       run: |
-        pyinstaller --onefile --noconsole --name HIS_MVP_Safe_V6.0 main.py
+        pyinstaller --onefile --noconsole --name HIS_MVP_Safe_V6.1 main.py
 
     - name: Upload EXE
       uses: actions/upload-artifact@v4
       with:
-        name: HIS_MVP_Safe_V6.0
-        path: dist/HIS_MVP_Safe_V6.0.exe
+        name: HIS_MVP_Safe_V6.1
+        path: dist/HIS_MVP_Safe_V6.1.exe
