@@ -32,7 +32,7 @@ RPA_CONFIG = {
 }
 
 DB_FILE = "his_data.db"
-APP_VERSION = "6.1"
+APP_VERSION = "6.2"
 is_running_auto = False
 is_paused_auto = False
 stop_requested = False
@@ -270,7 +270,7 @@ def render_patient_template(template, patient):
         template = template.replace("{{" + key + "}}", value)
     return template
 
-def create_his_record(patient, template, record_time=None, record_title=None):
+def create_his_record(patient, template, record_time=None, record_title=None, replace_patient_fields=True):
     mouse_click(*RPA_CONFIG["AREA_PROGRESS_RECORD"])
     time.sleep(0.3)
     mouse_click(*RPA_CONFIG["BTN_NEW_RECORD"])
@@ -301,15 +301,13 @@ def create_his_record(patient, template, record_time=None, record_title=None):
         time.sleep(0.3)
         press_key(0x0D)
         time.sleep(1.2)
-        mouse_click(*RPA_CONFIG["AREA_PROGRESS_RECORD"])
-        time.sleep(0.3)
         press_key(0x0D)
         time.sleep(0.2)
     else:
         mouse_double_click(*RPA_CONFIG["TPL_OPTION"])
         time.sleep(1.2)
 
-    final_text = render_patient_template(template, patient)
+    final_text = render_patient_template(template, patient) if replace_patient_fields else template
     paste_text(final_text)
     time.sleep(0.8)
     user32.keybd_event(0x11, 0, 0, 0)
@@ -367,25 +365,20 @@ def start_automation_flow(patients, target_patients, target_time_obj, template):
         summary += "\n任务已按 F9 安全终止。"
     finish_automation(summary)
 
-def start_supplement_flow(patients, record_times, templates, record_title):
+def start_supplement_flow(record_times, templates, record_title):
     time.sleep(0.5)
-    patient = find_patient_from_window(patients)
-    if not patient:
-        finish_automation("当前 HIS 窗口患者未能与本地患者库唯一匹配，未执行任何写入。")
-        return
-
     created_count = 0
     for record_index, record_time in enumerate(record_times):
         if not wait_until_resumed():
             break
         content = templates[record_index % len(templates)]
-        status_update(f"{patient[0]}床 {patient[1]}: 第 {record_index + 1}/{len(record_times)} 条")
-        create_his_record(patient, content, record_time, record_title)
+        status_update(f"当前 HIS 患者: 第 {record_index + 1}/{len(record_times)} 条")
+        create_his_record(None, content, record_time, record_title, replace_patient_fields=False)
         created_count += 1
         if stop_requested:
             break
 
-    summary = f"{patient[0]}床 {patient[1]}：已创建 {created_count} 条补充病史。"
+    summary = f"当前 HIS 患者：已创建 {created_count} 条补充病史。"
     if stop_requested:
         summary += "\n任务已按 F9 安全终止。"
     finish_automation(summary)
@@ -547,16 +540,12 @@ def run_supplement_thread():
         messagebox.showwarning("任务运行中", "请先完成或终止当前任务。")
         return
     try:
-        patients = load_all_patients()
         start_date = datetime.strptime(supp_start_date_entry.get().strip(), "%Y-%m-%d").date()
         start_clock = datetime.strptime(supp_time_entry.get().strip(), "%H:%M").time()
         start_time = datetime.combine(start_date, start_clock)
         record_times = build_supplement_times(start_time, supp_interval_var.get(), datetime.now())
     except ValueError as exc:
         messagebox.showerror("参数错误", str(exc))
-        return
-    if not patients:
-        messagebox.showwarning("无患者", "本地患者库为空。")
         return
     if not record_times:
         messagebox.showwarning("时间范围无效", "起始时间晚于当前系统时间，没有可创建的病史。")
@@ -605,7 +594,7 @@ def run_supplement_thread():
     root.iconify()
     threading.Thread(
         target=run_automation_worker,
-        args=(start_supplement_flow, (patients, record_times, templates, record_title)),
+        args=(start_supplement_flow, (record_times, templates, record_title)),
         daemon=True
     ).start()
 
