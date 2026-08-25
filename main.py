@@ -7,7 +7,6 @@ import ctypes.wintypes
 import threading
 import time
 import calendar
-from collections import Counter
 from datetime import datetime, timedelta
 
 # [核心防御] 强制系统 DPI 感知
@@ -33,7 +32,7 @@ RPA_CONFIG = {
 }
 
 DB_FILE = "his_data.db"
-APP_VERSION = "6.3"
+APP_VERSION = "6.4"
 is_running_auto = False
 is_paused_auto = False
 stop_requested = False
@@ -43,16 +42,13 @@ HOTKEY_STOP_ID = 2
 VK_F8 = 0x77
 VK_F9 = 0x78
 WM_HOTKEY = 0x0312
-WM_GETOBJECT = 0x003D
 MOD_NOREPEAT = 0x4000
-OBJID_CLIENT = -4
-SMTO_ABORTIFHUNG = 0x0002
 DEFAULT_SUPPLEMENT_TITLE = "高一鸣主治医师查房记录"
 SCOPE_ALL = "全部"
 SCOPE_INCLUDE = "指定范围"
 SCOPE_EXCLUDE = "跳过床位"
 INTERVAL_DAYS = {"7天": 7, "14天": 14}
-INTERVAL_MONTHS = {"1个月": 1, "2个月": 2}
+INTERVAL_MONTHS = {"1个月": 1, "2个月": 2, "3个月": 3}
 WORD_TEMPLATE_NAME = "中医会诊单"
 WORD_DEPARTMENT = "浦二"
 WORD_FIXED_ADMIT_DATE = "2022.9.20"
@@ -94,117 +90,6 @@ def get_pixel_color(x, y):
     g = (pixel & 0x00ff00) >> 8
     b = (pixel & 0xff0000) >> 16
     return (r, g, b)
-
-def group_visual_bands(row_scores, start_y, threshold=3):
-    bands = []
-    band_start = None
-    for offset, score in enumerate(row_scores):
-        if score >= threshold and band_start is None:
-            band_start = start_y + offset
-        elif score < threshold and band_start is not None:
-            band_end = start_y + offset - 1
-            if 2 <= band_end - band_start + 1 <= 16:
-                bands.append((band_start, band_end))
-            band_start = None
-    if band_start is not None:
-        band_end = start_y + len(row_scores) - 1
-        if 2 <= band_end - band_start + 1 <= 16:
-            bands.append((band_start, band_end))
-    return bands
-
-def select_row_sequence(centers, expected_first, expected_gap):
-    if not centers:
-        return []
-    first = min(centers, key=lambda center: abs(center - expected_first))
-    if abs(first - expected_first) > expected_gap:
-        return []
-    sequence = [first]
-    remaining = [center for center in centers if center > first]
-    while remaining:
-        expected = sequence[-1] + expected_gap
-        candidates = [center for center in remaining if expected_gap - 6 <= center - sequence[-1] <= expected_gap + 8]
-        if not candidates:
-            break
-        next_center = min(candidates, key=lambda center: abs(center - expected))
-        sequence.append(next_center)
-        remaining = [center for center in remaining if center > next_center]
-    return sequence
-
-def get_window_class(hwnd):
-    if not hwnd:
-        return ""
-    buff = ctypes.create_unicode_buffer(256)
-    user32.GetClassNameW(hwnd, buff, len(buff))
-    return buff.value
-
-def get_window_rect(hwnd):
-    rect = ctypes.wintypes.RECT()
-    if not hwnd or not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-        return None
-    return (rect.left, rect.top, rect.right, rect.bottom)
-
-def has_msaa_provider(hwnd):
-    if not hwnd:
-        return False
-    result = ctypes.c_size_t()
-    sent = user32.SendMessageTimeoutW(
-        hwnd, WM_GETOBJECT, 0, ctypes.c_long(OBJID_CLIENT).value,
-        SMTO_ABORTIFHUNG, 400, ctypes.byref(result)
-    )
-    return bool(sent and result.value)
-
-def enumerate_child_controls(root_hwnd):
-    controls = []
-    callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
-
-    def collect(hwnd, _):
-        controls.append({
-            "hwnd": hwnd,
-            "class": get_window_class(hwnd),
-            "rect": get_window_rect(hwnd),
-            "visible": bool(user32.IsWindowVisible(hwnd)),
-            "enabled": bool(user32.IsWindowEnabled(hwnd)),
-        })
-        return True
-
-    callback = callback_type(collect)
-    user32.EnumChildWindows(root_hwnd, callback, 0)
-    return controls
-
-def detect_visual_row_centers():
-    screen_width = user32.GetSystemMetrics(0)
-    screen_height = user32.GetSystemMetrics(1)
-    first_x, first_y = RPA_CONFIG["PATIENT_FIRST_ROW"]
-    x_start = max(0, first_x - 50)
-    x_end = min(screen_width - 1, first_x + 180)
-    y_start = max(0, first_y - 10)
-    y_end = max(y_start, screen_height - 12)
-    hdc = user32.GetDC(0)
-    row_scores = []
-    try:
-        for y in range(y_start, y_end + 1):
-            dark_pixels = 0
-            for x in range(x_start, x_end + 1, 3):
-                pixel = gdi32.GetPixel(hdc, x, y)
-                if pixel == -1:
-                    continue
-                r = pixel & 0x0000ff
-                g = (pixel & 0x00ff00) >> 8
-                b = (pixel & 0xff0000) >> 16
-                if (r * 30 + g * 59 + b * 11) // 100 < 170:
-                    dark_pixels += 1
-            row_scores.append(dark_pixels)
-    finally:
-        user32.ReleaseDC(0, hdc)
-    bands = group_visual_bands(row_scores, y_start)
-    centers = [(start + end) // 2 for start, end in bands]
-    sequence = select_row_sequence(centers, first_y, RPA_CONFIG["LINE_HEIGHT"])
-    return {
-        "region": (x_start, y_start, x_end, y_end),
-        "bands": bands,
-        "centers": centers,
-        "sequence": sequence,
-    }
 
 def press_key(vk_code):
     user32.keybd_event(vk_code, 0, 0, 0)
@@ -318,7 +203,7 @@ def load_all_patients():
     conn.close()
     return sorted(patients, key=patient_sort_key)
 
-# ==================== 3. 核心全自动逻辑引擎 (V6.1) ====================
+# ==================== 3. 核心全自动逻辑引擎 (V6.4) ====================
 def status_update(msg, color=None):
     def apply_update():
         status_label.config(text=msg)
@@ -370,6 +255,47 @@ def open_patient_row(row_number, total_rows, patients):
     mouse_click(*RPA_CONFIG["AREA_SAFE_BLANK"])
     time.sleep(0.5)
     return find_patient_from_window(patients)
+
+def locate_target_patient(target_patient, patients, total_rows):
+    target_bed = normalize_bed(target_patient[0])
+    if target_bed.isdigit():
+        row_number = max(1, int(target_bed))
+    else:
+        row_number = 1
+
+    visited_rows = set()
+    current_patient = open_patient_row(row_number, total_rows, patients)
+    visited_rows.add(row_number)
+    if current_patient and normalize_bed(current_patient[0]) == target_bed:
+        return current_patient
+
+    current_bed = normalize_bed(current_patient[0]) if current_patient else ""
+    if current_bed.isdigit() and target_bed.isdigit() and abs(int(target_bed) - int(current_bed)) > 3:
+        correction = int(target_bed) - int(current_bed)
+        row_number = max(1, min(total_rows, row_number + correction))
+        if row_number not in visited_rows:
+            current_patient = open_patient_row(row_number, total_rows, patients)
+            visited_rows.add(row_number)
+            if current_patient and normalize_bed(current_patient[0]) == target_bed:
+                return current_patient
+
+    for _ in range(12):
+        if stop_requested:
+            return None
+        current_bed = normalize_bed(current_patient[0]) if current_patient else ""
+        if current_bed.isdigit() and target_bed.isdigit():
+            direction = 1 if int(target_bed) > int(current_bed) else -1
+        else:
+            direction = 1
+        next_row = row_number + direction
+        if next_row < 1 or next_row > total_rows or next_row in visited_rows:
+            return None
+        row_number = next_row
+        current_patient = open_patient_row(row_number, total_rows, patients)
+        visited_rows.add(row_number)
+        if current_patient and normalize_bed(current_patient[0]) == target_bed:
+            return current_patient
+    return None
 
 def render_patient_template(template, patient):
     values = {
@@ -451,18 +377,19 @@ def start_automation_flow(patients, target_patients, target_time_obj, template):
     target_beds = {normalize_bed(patient[0]) for patient in target_patients}
     processed_beds = set()
     record_index = 0
-    for row_number in range(1, len(patients) + 1):
+    ordered_targets = sorted(target_patients, key=patient_sort_key)
+    for target_patient in ordered_targets:
         if stop_requested or processed_beds == target_beds:
             break
-        patient = open_patient_row(row_number, len(patients), patients)
+        patient = locate_target_patient(target_patient, patients, len(patients))
         if stop_requested:
             break
         if not patient:
-            status_update(f"【跳过】第 {row_number} 行患者未唯一匹配")
+            status_update(f"【跳过】{target_patient[0]}床未定位成功")
             continue
         bed = normalize_bed(patient[0])
         if bed not in target_beds or bed in processed_beds:
-            status_update(f"【跳过】{patient[0]}床 {patient[1]}")
+            status_update(f"【跳过】{patient[0]}床 {patient[1]}，校验床位不在目标范围")
             continue
         if not wait_until_resumed():
             break
@@ -540,121 +467,6 @@ def toggle_scope_entry():
     state = tk.DISABLED if scope_var.get() == SCOPE_ALL else tk.NORMAL
     for entry in scope_entries:
         entry.config(state=state)
-
-def collect_patient_list_probe():
-    first_x, first_y = RPA_CONFIG["PATIENT_FIRST_ROW"]
-    point = ctypes.wintypes.POINT(first_x, first_y)
-    window_from_point = user32.WindowFromPoint
-    window_from_point.argtypes = [ctypes.wintypes.POINT]
-    window_from_point.restype = ctypes.wintypes.HWND
-    point_hwnd = window_from_point(point)
-    foreground_hwnd = user32.GetForegroundWindow()
-    root_hwnd = user32.GetAncestor(point_hwnd, 2) if point_hwnd else foreground_hwnd
-    if not root_hwnd:
-        root_hwnd = foreground_hwnd
-
-    controls = enumerate_child_controls(root_hwnd) if root_hwnd else []
-    class_counts = Counter(control["class"] or "<empty>" for control in controls)
-    keywords = ("list", "grid", "tree", "view", "data", "patient")
-    candidates = [
-        control for control in controls
-        if any(keyword in control["class"].lower() for keyword in keywords)
-    ]
-    visual = detect_visual_row_centers()
-    root_msaa = has_msaa_provider(root_hwnd)
-    point_msaa = has_msaa_provider(point_hwnd)
-
-    candidate_lines = []
-    candidate_msaa = False
-    for control in candidates[:12]:
-        msaa = has_msaa_provider(control["hwnd"])
-        candidate_msaa = candidate_msaa or msaa
-        candidate_lines.append(
-            f"  - class={control['class'] or '<empty>'}, rect={control['rect']}, "
-            f"visible={control['visible']}, enabled={control['enabled']}, MSAA={msaa}"
-        )
-    if not candidate_lines:
-        candidate_lines.append("  - 未发现类名包含 list/grid/tree/view/data 的子控件")
-
-    if point_msaa or candidate_msaa:
-        recommendation = "优先尝试 MSAA 可访问性读取行项目和坐标。"
-    elif candidates:
-        recommendation = "优先测试标准控件或键盘 Home/Down 遍历。"
-    elif len(visual["sequence"]) >= 3:
-        recommendation = "控件可能为自绘；可继续开发 GDI 动态分行。"
-    else:
-        recommendation = "未发现稳定结构；先测试键盘遍历，再保留固定坐标兜底。"
-
-    classes = ", ".join(
-        f"{name}:{count}" for name, count in class_counts.most_common(20)
-    ) or "无"
-    centers = ", ".join(str(center) for center in visual["centers"][:40]) or "无"
-    sequence = ", ".join(str(center) for center in visual["sequence"]) or "无"
-    return "\n".join([
-        f"HIS 患者列表只读探测报告 V{APP_VERSION}",
-        "报告不包含窗口标题、控件文字或患者姓名。",
-        "",
-        f"屏幕尺寸: {user32.GetSystemMetrics(0)} x {user32.GetSystemMetrics(1)}",
-        f"首行探测点: ({first_x}, {first_y})",
-        f"前台窗口类名: {get_window_class(foreground_hwnd) or '<empty>'}",
-        f"探测点窗口类名: {get_window_class(point_hwnd) or '<empty>'}",
-        f"根窗口类名: {get_window_class(root_hwnd) or '<empty>'}",
-        f"根窗口 MSAA 响应: {root_msaa}",
-        f"探测点 MSAA 响应: {point_msaa}",
-        "",
-        f"子控件总数: {len(controls)}",
-        f"子控件类名统计: {classes}",
-        "疑似列表控件:",
-        *candidate_lines,
-        "",
-        f"GDI 探测区域: {visual['region']}",
-        f"文字带候选数: {len(visual['bands'])}",
-        f"候选中心Y: {centers}",
-        f"按当前18像素间距组成的序列: {sequence}",
-        "",
-        f"建议: {recommendation}",
-    ])
-
-def show_patient_list_probe(report):
-    root.deiconify()
-    status_update("患者列表探测完成。", "green")
-    window = tk.Toplevel(root)
-    window.title("患者列表探测报告")
-    window.geometry("760x520")
-    text = tk.Text(window, wrap=tk.WORD, font=("Consolas", 10))
-    text.insert(tk.END, report)
-    text.config(state=tk.DISABLED)
-    text.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
-    buttons = tk.Frame(window)
-    buttons.pack(fill=tk.X, padx=8, pady=(0, 8))
-    tk.Button(buttons, text="复制报告", command=lambda: pyperclip.copy(report)).pack(side=tk.LEFT)
-    tk.Button(buttons, text="关闭", command=window.destroy).pack(side=tk.RIGHT)
-
-def patient_list_probe_worker():
-    try:
-        time.sleep(0.8)
-        mouse_click(*RPA_CONFIG["BTN_SWITCH_PATIENT"])
-        time.sleep(1.0)
-        report = collect_patient_list_probe()
-        mouse_click(*RPA_CONFIG["AREA_SAFE_BLANK"])
-        root.after(0, lambda: show_patient_list_probe(report))
-    except Exception as exc:
-        error_report = f"探测失败: {exc}"
-        root.after(0, lambda report=error_report: show_patient_list_probe(report))
-
-def run_patient_list_probe():
-    if is_running_auto:
-        messagebox.showwarning("任务运行中", "请先完成或终止当前任务。")
-        return
-    if not messagebox.askyesno(
-        "开始只读探测",
-        "程序将最小化并自动打开患者列表。\n不会选择患者或写入病史。\n\n确认开始吗？"
-    ):
-        return
-    status_update("程序将最小化并探测患者列表...", "blue")
-    root.update()
-    root.iconify()
-    threading.Thread(target=patient_list_probe_worker, daemon=True).start()
 
 def run_thread():
     global is_running_auto, is_paused_auto, stop_requested
@@ -941,7 +753,6 @@ def setup_ui():
     tk.Label(scope_fm, text="例如 1-8,13-17", fg="gray").pack(side=tk.LEFT)
     bf = tk.Frame(cf); bf.pack(pady=10)
     tk.Button(bf, text="▶ 启动执行流", bg="#dff0d8", command=run_thread, width=22, height=2).pack(side=tk.LEFT, padx=6)
-    tk.Button(bf, text="列表探测", command=run_patient_list_probe, width=14, height=2).pack(side=tk.LEFT, padx=6)
     tk.Button(bf, text="■ 安全终止 (F9)", bg="#f2dede", command=stop_auto, width=16, height=2).pack(side=tk.LEFT, padx=6)
     status_label = tk.Label(cf, text="就绪。F8 暂停/继续，F9 安全终止。", fg="green", font=("Arial", 10)); status_label.pack(pady=5)
     
@@ -972,7 +783,7 @@ def setup_ui():
     supp_start_date_entry = tk.Entry(supp_top, width=11, justify="center"); supp_start_date_entry.insert(0, datetime.now().strftime("%Y-%m-%d")); supp_start_date_entry.pack(side=tk.LEFT, padx=3)
     supp_time_entry = tk.Entry(supp_top, width=6, justify="center"); supp_time_entry.insert(0, "09:00"); supp_time_entry.pack(side=tk.LEFT, padx=3)
     supp_interval_var = tk.StringVar(value="7天")
-    ttk.Combobox(supp_top, width=7, textvariable=supp_interval_var, values=("7天", "14天", "1个月", "2个月"), state="readonly").pack(side=tk.LEFT, padx=6)
+    ttk.Combobox(supp_top, width=7, textvariable=supp_interval_var, values=("7天", "14天", "1个月", "2个月", "3个月"), state="readonly").pack(side=tk.LEFT, padx=6)
 
     template_frame = tk.LabelFrame(tab5, text="病史模板"); template_frame.pack(fill=tk.X, padx=10, pady=8)
     supp_template_vars = [tk.StringVar() for _ in range(3)]
