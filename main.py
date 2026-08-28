@@ -32,7 +32,7 @@ RPA_CONFIG = {
 }
 
 DB_FILE = "his_data.db"
-APP_VERSION = "6.4"
+APP_VERSION = "6.5"
 is_running_auto = False
 is_paused_auto = False
 stop_requested = False
@@ -228,6 +228,14 @@ def find_patient_from_window(patients):
     matches = [patient for patient in patients if clean_text(patient[1]) and clean_text(patient[1]) in window_title]
     return matches[0] if len(matches) == 1 else None
 
+def find_current_patient_with_retry(patients, attempts=5):
+    for _ in range(attempts):
+        patient = find_patient_from_window(patients)
+        if patient:
+            return patient
+        time.sleep(0.4)
+    return None
+
 def open_patient_row(row_number, total_rows, patients):
     if not wait_until_resumed():
         return None
@@ -373,15 +381,25 @@ def run_automation_worker(target, args):
     except Exception as exc:
         finish_automation(f"执行过程中发生异常，任务已停止。\n{exc}")
 
-def start_automation_flow(patients, target_patients, target_time_obj, template):
+def start_automation_flow(patients, target_patients, target_time_obj, template, initial_patient=None):
     target_beds = {normalize_bed(patient[0]) for patient in target_patients}
     processed_beds = set()
     record_index = 0
     ordered_targets = sorted(target_patients, key=patient_sort_key)
+    initial_bed = normalize_bed(initial_patient[0]) if initial_patient else ""
+    if initial_bed in target_beds:
+        ordered_targets = [initial_patient] + [
+            patient for patient in ordered_targets
+            if normalize_bed(patient[0]) != initial_bed
+        ]
     for target_patient in ordered_targets:
         if stop_requested or processed_beds == target_beds:
             break
-        patient = locate_target_patient(target_patient, patients, len(patients))
+        if initial_bed and normalize_bed(target_patient[0]) == initial_bed:
+            patient = initial_patient
+            initial_bed = ""
+        else:
+            patient = locate_target_patient(target_patient, patients, len(patients))
         if stop_requested:
             break
         if not patient:
@@ -406,6 +424,17 @@ def start_automation_flow(patients, target_patients, target_time_obj, template):
     if stop_requested:
         summary += "\n任务已按 F9 安全终止。"
     finish_automation(summary)
+
+def start_batch_worker(patients, target_patients, target_time_obj, template, use_current_patient):
+    initial_patient = find_current_patient_with_retry(patients) if use_current_patient else None
+    target_beds = {normalize_bed(patient[0]) for patient in target_patients}
+    if initial_patient and normalize_bed(initial_patient[0]) not in target_beds:
+        initial_patient = None
+    if initial_patient:
+        status_update(f"已识别当前 HIS 患者：{initial_patient[0]}床 {initial_patient[1]}，直接开始")
+    else:
+        status_update("当前 HIS 患者不在目标范围或未能唯一识别，按列表定位")
+    start_automation_flow(patients, target_patients, target_time_obj, template, initial_patient)
 
 def start_supplement_flow(record_times, templates, record_title):
     time.sleep(0.5)
@@ -505,7 +534,7 @@ def run_thread():
         root.iconify()
         threading.Thread(
             target=run_automation_worker,
-            args=(start_automation_flow, (patients, target_patients, target_time_obj, row[0])),
+            args=(start_batch_worker, (patients, target_patients, target_time_obj, row[0], use_current_batch_patient_var.get())),
             daemon=True
         ).start()
     except ValueError:
@@ -722,7 +751,7 @@ def copy_word_consult_text(event=None):
 def setup_ui():
     global tpl_listbox, status_label, lock_var, root, mgr_tree, mgr_tpl_listbox, p_bed, p_name, p_gender, p_age, p_admit, p_comp, p_adiag, p_cdiag, tpl_name_entry, tpl_content_text
     global word_start_entry, word_count_entry, word_template_text, word_status_label
-    global time_var, time_entry, scope_var, scope_text_var, scope_entries
+    global time_var, time_entry, scope_var, scope_text_var, scope_entries, use_current_batch_patient_var
     global supp_template_vars, supp_template_combos, supp_start_date_entry, supp_time_entry, supp_interval_var
     global supp_title_entry, supp_blank_title_var
     
@@ -751,6 +780,8 @@ def setup_ui():
     scope_entry = tk.Entry(scope_fm, width=24, textvariable=scope_text_var, state=tk.DISABLED)
     scope_entry.pack(side=tk.LEFT, padx=8); scope_entries.append(scope_entry)
     tk.Label(scope_fm, text="例如 1-8,13-17", fg="gray").pack(side=tk.LEFT)
+    use_current_batch_patient_var = tk.BooleanVar(value=True)
+    tk.Checkbutton(cf, text="优先使用当前 HIS 患者（在目标范围内时不重新定位）", variable=use_current_batch_patient_var).pack(pady=3)
     bf = tk.Frame(cf); bf.pack(pady=10)
     tk.Button(bf, text="▶ 启动执行流", bg="#dff0d8", command=run_thread, width=22, height=2).pack(side=tk.LEFT, padx=6)
     tk.Button(bf, text="■ 安全终止 (F9)", bg="#f2dede", command=stop_auto, width=16, height=2).pack(side=tk.LEFT, padx=6)
